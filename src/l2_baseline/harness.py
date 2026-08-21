@@ -6,11 +6,10 @@ from openai import AsyncOpenAI
 
 from .config import Settings
 from .mcp_client import LunitMCPClient
-from .models import CitationSelection, Evidence, PlanDecision, ReflectionDecision, RetrievalResult
+from .models import CitationSelection, Evidence, ReflectionDecision, RetrievalResult
 from .prompts import (
     GENERATION_SYSTEM_PROMPT,
     HYDE_SYSTEM_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
     REACT_ACTION_SYSTEM_PROMPT,
     REFLECTION_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
@@ -34,14 +33,10 @@ def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> d
     }
 
 
-PLAN_TOOL = _decision_tool(
-    "submit_plan",
-    "Submit whether retrieval is needed and a self-contained query.",
-    {
-        "requires_retrieval": {"type": "boolean"},
-        "self_contained_query": {"type": "string"},
-        "reason": {"type": "string"},
-    },
+RETRIEVE_TOOL = _decision_tool(
+    "retrieve_relevant_content",
+    "Retrieve real evidence. Pass one self-contained query that resolves conversation context.",
+    {"query": {"type": "string"}},
 )
 REFLECTION_TOOL = _decision_tool(
     "submit_reflection",
@@ -82,6 +77,21 @@ def _arguments(raw: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError("L2 tool arguments must be a JSON object")
     return value
+
+
+def _assistant_message(message: Any) -> dict[str, Any]:
+    data: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+    if message.tool_calls:
+        data["tool_calls"] = [call.model_dump(mode="json") for call in message.tool_calls]
+    return data
+
+
+def _response_language_instruction(text: str) -> str:
+    if any("가" <= character <= "힣" for character in text):
+        return "The required response language is Korean."
+    if any(character.isascii() and character.isalpha() for character in text):
+        return "The required response language is English. Respond in English only."
+    return "Respond in the same language as the user's latest message."
 
 
 def _extract_evidence(tool_outputs: list[str], selection: CitationSelection) -> list[Evidence]:
@@ -142,11 +152,6 @@ class L2Harness:
         if not calls:
             raise RuntimeError(f"L2 did not call required tool {name}")
         return _arguments(calls[0].function.arguments)
-
-    async def plan(self, messages: list[dict[str, str]]) -> PlanDecision:
-        context = json.dumps(messages[-7:], ensure_ascii=False)
-        arguments = await self._forced_decision(PLANNER_SYSTEM_PROMPT, context, PLAN_TOOL)
-        return PlanDecision.model_validate(arguments)
 
     async def create_hypothetical_passage(self, query: str) -> str:
         response = await self.client.chat.completions.create(
@@ -265,31 +270,50 @@ class L2Harness:
         result.tool_calls = action_count
         return result
 
-    async def _generate(
-        self, messages: list[dict[str, str]], retrieval: RetrievalResult | None = None
-    ) -> str:
+    async def chat(self, messages: list[dict[str, str]]) -> str:
+        if not messages or messages[-1].get("role") != "user":
+            raise ValueError("messages must end with a user message")
+        generation_prompt = (
+            GENERATION_SYSTEM_PROMPT
+            + "\n"
+            + _response_language_instruction(messages[-1]["content"])
+        )
         generation_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": GENERATION_SYSTEM_PROMPT}, *messages
+            {"role": "system", "content": generation_prompt}, *messages
         ]
-        if retrieval is not None:
-            generation_messages.append(
-                {
-                    "role": "system",
-                    "content": "Retrieved real evidence follows:\n" + retrieval.for_generation(),
-                }
-            )
         response = await self.client.chat.completions.create(
+            model=self.settings.model,
+            messages=generation_messages,
+            tools=[RETRIEVE_TOOL],
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        message = response.choices[0].message
+        calls = message.tool_calls or []
+        if not calls:
+            return message.content or ""
+        retrieve_calls = [
+            call for call in calls if call.function.name == "retrieve_relevant_content"
+        ]
+        if not retrieve_calls:
+            raise RuntimeError("Generation returned an unsupported tool call")
+
+        selected_call = retrieve_calls[0]
+        query = _arguments(selected_call.function.arguments)["query"]
+        result = await self.retrieve(query)
+        generation_messages.append(_assistant_message(message))
+        for call in calls:
+            content = (
+                result.for_generation()
+                if call.id == selected_call.id
+                else "Only one retrieval call is allowed per answer."
+            )
+            generation_messages.append(
+                {"role": "tool", "tool_call_id": call.id, "content": content}
+            )
+        final_response = await self.client.chat.completions.create(
             model=self.settings.model,
             messages=generation_messages,
             temperature=0.2,
         )
-        return response.choices[0].message.content or ""
-
-    async def chat(self, messages: list[dict[str, str]]) -> str:
-        if not messages or messages[-1].get("role") != "user":
-            raise ValueError("messages must end with a user message")
-        plan = await self.plan(messages)
-        if not plan.requires_retrieval:
-            return await self._generate(messages)
-        result = await self.retrieve(plan.self_contained_query)
-        return await self._generate(messages, result)
+        return final_response.choices[0].message.content or ""
