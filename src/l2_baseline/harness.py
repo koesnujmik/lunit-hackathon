@@ -77,6 +77,59 @@ NEGATIVE_SCOPE_PATTERN = re.compile(
     r"outside (?:the )?scope|insufficient evidence to (?:recommend|support))\b",
     re.IGNORECASE,
 )
+KCD_MARKER_PATTERN = re.compile(r"\bKCD(?:-[89])?\b|(?:상병|질병)\s*코드", re.IGNORECASE)
+KCD_CODE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z]\d{2}(?:\.\d{1,2})?)(?![A-Za-z0-9.])",
+    re.IGNORECASE,
+)
+DAILYMED_MARKER_PATTERN = re.compile(
+    r"\bdailymed\b|\bdrug\s+label\b|\bprescribing\s+information\b",
+    re.IGNORECASE,
+)
+HIRA_MARKER_PATTERN = re.compile(
+    r"\bhira\b|\breimburs\w*\b|\bcoverage\s+criteria\b|"
+    r"심평원|급여\s*기준|보험\s*기준",
+    re.IGNORECASE,
+)
+MFDS_MARKER_PATTERN = re.compile(r"\bmfds\b|식약처", re.IGNORECASE)
+MFDS_DETAIL_PATTERN = re.compile(
+    r"허가\s*사항|적응증|효능.?효과|용법.?용량|금기|상호작용|임부|소아|고령자|"
+    r"신장애|경고|\bindications?\b|\bdos(?:e|age)\b|\badministration\b|"
+    r"\bcontraindications?\b|\binteractions?\b",
+    re.IGNORECASE,
+)
+MFDS_DOSAGE_PATTERN = re.compile(
+    r"용법.?용량|(?:투여|복용)\s*(?:용량|방법)|\bdos(?:e|age)\b|\badministration\b",
+    re.IGNORECASE,
+)
+ONCOLOGY_PATTERN = re.compile(
+    r"암|항암|종양|백혈병|림프종|\bcancer\b|\bcarcinoma\b|\boncolog\w*\b|"
+    r"\bleukemia\b|\blymphoma\b|\btumou?r\b",
+    re.IGNORECASE,
+)
+ONCOLOGY_DRUG_PATTERN = re.compile(
+    r"항암제|약제|투여|처방|요법|허가초과|\bdrug\b|\bmedication\b|\bregimen\b|"
+    r"\boff.?label\b",
+    re.IGNORECASE,
+)
+CITATION_PATTERN = re.compile(r"\[([1-9]\d*)\]")
+CITATION_REQUIRED_CLAIM_PATTERN = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9])[A-Z]\d{2}(?:\.\d{1,2})?(?![A-Za-z0-9.])|"
+    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:%|mg|mcg|µg|μg|g|mL|mmHg|mmol/L|"
+    r"mg/dL|IU/L|U/L|days?|weeks?|months?|years?)(?![A-Za-z])|"
+    r"허가\s*(?:되|받|상태|유효)|급여\s*(?:가|는|로|대상|인정|적용)|"
+    r"권고(?:한|합|됩|되)|인정(?:됩|되)|"
+    r"\b(?:approved|covered|reimbursed|recommended)\b"
+    r")",
+    re.IGNORECASE,
+)
+LIMITATION_CLAIM_PATTERN = re.compile(
+    r"확인(?:할\s*수\s*)?없|검증(?:할\s*수\s*)?없|근거가\s*없|"
+    r"\b(?:could not|cannot|unable to|not)\s+(?:verify|confirm|find)\b|"
+    r"\bno\s+(?:citable\s+)?evidence\b",
+    re.IGNORECASE,
+)
 
 
 def _log(event: str, **fields: object) -> None:
@@ -167,6 +220,17 @@ def _conversation_context(messages: list[dict[str, str]]) -> str:
     )
 
 
+def _latest_user_text(messages: list[dict[str, str]]) -> str:
+    return next(
+        (
+            message.get("content", "")
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+
+
 def _retrieval_hints(text: str) -> str:
     lowered = text.lower()
     hints: list[str] = []
@@ -231,6 +295,251 @@ def _deterministic_guideline_request(
         },
     )
     return "index_get_relevant_nodes", arguments
+
+
+def _kcd_revision(text: str) -> str:
+    match = re.search(r"\bKCD[-\s]?([89])\b", text, re.IGNORECASE)
+    return f"KCD-{match.group(1)}" if match else "latest"
+
+
+def _extract_kcd_disease_name(text: str) -> str | None:
+    patterns = (
+        re.compile(
+            r"(?P<name>[가-힣][가-힣A-Za-z0-9·+\-\s]{1,60}?)"
+            r"(?:의|에\s*대한)?\s*(?:정확한\s*)?(?:KCD(?:-[89])?|상병|질병)\s*코드",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:the\s+)?(?:exact\s+)?KCD(?:-[89])?\s+code\s+(?:for|of)\s+"
+            r"(?P<name>[A-Za-z][A-Za-z0-9+\-\s]{1,60}?)(?:[?.!,]|$)",
+            re.IGNORECASE,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        name = re.sub(r"\s+", " ", match.group("name")).strip(" ?.,:;\"'")
+        normalized = re.sub(r"\s+", "", name).lower()
+        if normalized not in {
+            "이질환",
+            "그질환",
+            "해당질환",
+            "thisdisease",
+            "thatdisease",
+        }:
+            return name
+    return None
+
+
+def _extract_dailymed_drug_name(text: str) -> str | None:
+    patterns = (
+        re.compile(
+            r"(?:dailymed(?:\s+(?:drug\s+)?label)?|drug\s+label|"
+            r"prescribing\s+information)\s+(?:for|of|on)\s+"
+            r"(?P<drug>[A-Za-z][A-Za-z0-9-]{1,40})",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<drug>[A-Za-z][A-Za-z0-9-]{1,40})(?:'s|의)?\s+"
+            r"(?:dailymed(?:\s+(?:drug\s+)?label)?|drug\s+label|"
+            r"prescribing\s+information)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"dailymed(?:에서)?\s+(?P<drug>[A-Za-z][A-Za-z0-9-]{1,40})",
+            re.IGNORECASE,
+        ),
+    )
+    rejected = {"drug", "label", "medicine", "medication", "this", "that", "the"}
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match and match.group("drug").lower() not in rejected:
+            return match.group("drug")
+    return None
+
+
+def _clean_hira_query(text: str) -> str | None:
+    query = re.sub(r"\bHIRA\b|심평원(?:에서|의)?", " ", text, flags=re.IGNORECASE)
+    query = re.sub(
+        r"(?:알려\s*줘|알려\s*주세요|검색해\s*줘|확인해\s*줘|확인해\s*주세요|"
+        r"무엇인가요|뭔가요|뭐야)\??$",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\s+", " ", query).strip(" ?.,:;\"'")
+    meaningful: set[str] = set()
+    for token in SEARCH_TOKEN_PATTERN.findall(query):
+        normalized = re.sub(r"(?:을|를|은|는|이|가|의)$", "", token.lower())
+        if normalized not in {
+            "급여",
+            "기준",
+            "급여기준",
+            "보험",
+            "현재",
+            "최신",
+            "coverage",
+            "criteria",
+            "current",
+            "latest",
+            "reimbursement",
+            "what",
+            "the",
+        }:
+            meaningful.add(normalized)
+    return query if meaningful else None
+
+
+def _hira_arguments(text: str, query: str) -> dict[str, Any]:
+    off_label_regimen = bool(
+        re.search(r"허가\s*초과|\boff.?label\b|\bregimen\b", text, re.IGNORECASE)
+    )
+    oncology = bool(ONCOLOGY_PATTERN.search(text))
+    oncology_drug = bool(
+        off_label_regimen or (oncology and ONCOLOGY_DRUG_PATTERN.search(text))
+    )
+    document_type = (
+        "cancer_drug_notice" if oncology_drug else "all" if oncology else "update"
+    )
+    return {
+        "query": query,
+        "current_only": True,
+        "limit": 5,
+        "search_mode": "both",
+        "document_type": document_type,
+        "source_type": "hira_cancer_drug_regimen" if off_label_regimen else "all",
+    }
+
+
+def _extract_mfds_product_name(text: str) -> str | None:
+    patterns = (
+        re.compile(
+            r"[\"'“](?P<drug>[가-힣][가-힣A-Za-z0-9·+\-]{1,39})[\"'”]"
+            r".{0,20}(?:식약처|MFDS)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<drug>[가-힣][가-힣A-Za-z0-9·+\-]{0,39}?)(?:의|에\s*대한)?\s*"
+            r"(?:식약처|MFDS)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:식약처|MFDS)(?:에서|의)?\s+(?P<drug>[가-힣][가-힣A-Za-z0-9·+\-]{0,39}?)"
+            r"(?:의|이라는\s*제품의)?\s*(?:허가|승인)",
+            re.IGNORECASE,
+        ),
+    )
+    rejected = {"이약", "그약", "해당약", "약", "약물", "의약품", "제품"}
+    for pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        product = match.group("drug").strip()
+        if re.sub(r"\s+", "", product) not in rejected:
+            return product
+    return None
+
+
+def _mfds_indication_arguments(text: str, drug_name: str) -> dict[str, Any] | None:
+    if not MFDS_DETAIL_PATTERN.search(text):
+        return None
+    notice_clause = "투여하지 말"
+    for clause in ("상호작용", "임부", "소아", "고령자", "신장애", "경고"):
+        if clause in text:
+            notice_clause = clause
+            break
+    return {
+        "drug_name": drug_name,
+        "num_rows": 3,
+        "include_dosage": bool(MFDS_DOSAGE_PATTERN.search(text)),
+        "notice_clause": notice_clause,
+    }
+
+
+def _deterministic_structured_request(
+    latest_user_text: str, available_names: set[str]
+) -> tuple[str, dict[str, Any]] | None:
+    """Select a direct structured lookup only when one source and entity are explicit."""
+    source_families = sum(
+        bool(pattern.search(latest_user_text))
+        for pattern in (
+            KCD_MARKER_PATTERN,
+            DAILYMED_MARKER_PATTERN,
+            HIRA_MARKER_PATTERN,
+            MFDS_MARKER_PATTERN,
+        )
+    )
+    if source_families != 1:
+        return None
+
+    if KCD_MARKER_PATTERN.search(latest_user_text):
+        code_match = KCD_CODE_PATTERN.search(latest_user_text)
+        if code_match and "kcd_get_name" in available_names:
+            return "kcd_get_name", {
+                "code": code_match.group(1).upper(),
+                "revision": _kcd_revision(latest_user_text),
+            }
+        disease_name = _extract_kcd_disease_name(latest_user_text)
+        if disease_name and "kcd_search_codes" in available_names:
+            return "kcd_search_codes", {
+                "name": disease_name,
+                "lang": "auto",
+                "top_k": 5,
+                "revision": _kcd_revision(latest_user_text),
+            }
+
+    if (
+        DAILYMED_MARKER_PATTERN.search(latest_user_text)
+        and "adr_retrieve_drug_info" in available_names
+    ):
+        drug_name = _extract_dailymed_drug_name(latest_user_text)
+        if drug_name:
+            return "adr_retrieve_drug_info", {"drug_name": drug_name}
+
+    if (
+        HIRA_MARKER_PATTERN.search(latest_user_text)
+        and "hira_updates_search" in available_names
+    ):
+        query = _clean_hira_query(latest_user_text)
+        if query:
+            return "hira_updates_search", _hira_arguments(latest_user_text, query)
+
+    if (
+        MFDS_MARKER_PATTERN.search(latest_user_text)
+        and "openapi_mfds_check_drug_permission" in available_names
+    ):
+        product_name = _extract_mfds_product_name(latest_user_text)
+        if product_name:
+            return "openapi_mfds_check_drug_permission", {
+                "drug_name": product_name,
+                "num_rows": 5,
+            }
+
+    return None
+
+
+def _citation_audit(answer: str, evidence_count: int) -> list[str]:
+    """Find high-confidence citation failures without mutating the L2 answer."""
+    cited_numbers = [int(number) for number in CITATION_PATTERN.findall(answer)]
+    issues: list[str] = []
+    if evidence_count and not cited_numbers:
+        issues.append("missing_all_citations")
+    if any(number > evidence_count for number in cited_numbers):
+        issues.append("citation_out_of_range")
+
+    uncited_claims = 0
+    for segment in re.split(r"(?<=[.!?])\s+|\n+", answer):
+        if (
+            segment.strip()
+            and not CITATION_PATTERN.search(segment)
+            and CITATION_REQUIRED_CLAIM_PATTERN.search(segment)
+            and not LIMITATION_CLAIM_PATTERN.search(segment)
+        ):
+            uncited_claims += 1
+    if uncited_claims:
+        issues.append(f"uncited_source_claims:{uncited_claims}")
+    return issues
 
 
 def _index_page_arguments(
@@ -359,6 +668,7 @@ class L2Harness:
     async def retrieve(self, messages: list[dict[str, str]]) -> RetrievalResult:
         started = time.monotonic()
         context = _conversation_context(messages)
+        latest_user_text = _latest_user_text(messages)
         search_text = f"{context}\n\nSEARCH HINTS: {_retrieval_hints(context)}"
 
         async with self.mcp_factory(
@@ -379,7 +689,9 @@ class L2Harness:
                 )
 
             available_names = {tool["function"]["name"] for tool in tools}
-            deterministic = _deterministic_guideline_request(context, available_names)
+            deterministic = _deterministic_guideline_request(
+                context, available_names
+            ) or _deterministic_structured_request(latest_user_text, available_names)
             if deterministic:
                 primary_name, primary_arguments = deterministic
                 _log(
@@ -440,6 +752,27 @@ class L2Harness:
                     if page_output:
                         documents.append(
                             page_output[: self.settings.max_tool_result_chars]
+                        )
+            elif primary_name == "openapi_mfds_check_drug_permission":
+                if primary_output:
+                    documents.append(primary_output[: self.settings.max_tool_result_chars])
+                indication_arguments = _mfds_indication_arguments(
+                    latest_user_text, str(primary_arguments.get("drug_name", ""))
+                )
+                if (
+                    indication_arguments
+                    and "openapi_mfds_get_drug_indication" in available_names
+                    and self.settings.max_retrieval_calls >= 2
+                ):
+                    indication_output = await self._safe_mcp_call(
+                        mcp,
+                        "openapi_mfds_get_drug_indication",
+                        indication_arguments,
+                    )
+                    tool_calls += 1
+                    if indication_output:
+                        documents.append(
+                            indication_output[: self.settings.max_tool_result_chars]
                         )
             elif primary_output:
                 documents.append(primary_output[: self.settings.max_tool_result_chars])
@@ -558,7 +891,10 @@ class L2Harness:
                 "description. Do not mention or infer any guideline, authority, study, threshold, "
                 "or statistic absent from the evidence. If the evidence is incomplete, state only "
                 "that limitation instead of filling the gap from memory. Keep the grounded answer "
-                "focused and under 350 words."
+                "focused and under 350 words. Before returning, silently audit the final draft: "
+                "every official decision, KCD code, dosage, threshold, date, price, and other "
+                "source-specific number must carry an in-range citation in the same sentence. "
+                "Delete an unsupported claim or state the limitation."
             )
         else:
             grounding_rules = (
@@ -574,4 +910,12 @@ class L2Harness:
             + "\n\nRETRIEVAL RESULT:\n"
             + retrieval.for_generation(self.settings.max_evidence_chars)
         )
-        return await self._generate(grounded_prompt, compact_messages)
+        answer = await self._generate(grounded_prompt, compact_messages)
+        citation_issues = _citation_audit(answer, len(retrieval.evidence))
+        _log(
+            "citation_audit_completed",
+            passed=not citation_issues,
+            issues=citation_issues,
+            evidence_count=len(retrieval.evidence),
+        )
+        return answer

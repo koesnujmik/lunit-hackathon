@@ -10,8 +10,10 @@ from openai import InternalServerError
 from l2_baseline.config import Settings
 from l2_baseline.harness import (
     L2Harness,
+    _citation_audit,
     _compact_messages,
     _deterministic_guideline_request,
+    _deterministic_structured_request,
     _index_page_arguments,
     _needs_retrieval,
     _prepare_primary_arguments,
@@ -58,6 +60,11 @@ class FakeMCP:
             _tool("index_get_relevant_nodes", "Find relevant clinical guideline sections"),
             _tool("openapi_law_search", "Search Korean laws"),
             _tool("kcd_search_codes", "Search KCD disease codes"),
+            _tool("kcd_get_name", "Get a KCD disease name"),
+            _tool("adr_retrieve_drug_info", "Retrieve DailyMed drug labels"),
+            _tool("hira_updates_search", "Search HIRA reimbursement updates"),
+            _tool("openapi_mfds_check_drug_permission", "Check MFDS permission"),
+            _tool("openapi_mfds_get_drug_indication", "Get MFDS indication"),
         ]
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -199,6 +206,83 @@ def test_unambiguous_guideline_route_skips_tool_selector() -> None:
     assert _deterministic_guideline_request(
         "심평원 급여 기준 가이드라인", {"index_get_relevant_nodes"}
     ) is None
+
+
+def test_structured_routes_use_exact_tool_schemas() -> None:
+    tools = {
+        "kcd_search_codes",
+        "kcd_get_name",
+        "adr_retrieve_drug_info",
+        "hira_updates_search",
+        "openapi_mfds_check_drug_permission",
+    }
+
+    assert _deterministic_structured_request(
+        "당뇨병의 정확한 KCD-9 코드는?", tools
+    ) == (
+        "kcd_search_codes",
+        {"name": "당뇨병", "lang": "auto", "top_k": 5, "revision": "KCD-9"},
+    )
+    assert _deterministic_structured_request("KCD-9 E11.9의 공식 명칭은?", tools) == (
+        "kcd_get_name",
+        {"code": "E11.9", "revision": "KCD-9"},
+    )
+    assert _deterministic_structured_request(
+        "What warnings are in the DailyMed label for aspirin?", tools
+    ) == ("adr_retrieve_drug_info", {"drug_name": "aspirin"})
+
+
+def test_structured_routes_reject_ambiguous_or_multi_source_requests() -> None:
+    tools = {
+        "adr_retrieve_drug_info",
+        "hira_updates_search",
+        "openapi_mfds_check_drug_permission",
+    }
+
+    assert _deterministic_structured_request("이 약의 DailyMed 라벨을 알려줘", tools) is None
+    assert (
+        _deterministic_structured_request(
+            "키트루다의 식약처 허가와 HIRA 급여 기준을 확인해줘", tools
+        )
+        is None
+    )
+
+
+def test_citation_audit_detects_only_high_confidence_failures() -> None:
+    assert _citation_audit("KCD-9 코드는 E11.9입니다 [1].", evidence_count=1) == []
+    assert _citation_audit(
+        "정확한 식약처 허가 상태는 확인할 수 없습니다.", evidence_count=0
+    ) == []
+
+    issues = _citation_audit(
+        "식약처 허가 상태는 유효합니다. 권장 용량은 50 mg입니다 [3].",
+        evidence_count=2,
+    )
+    assert "citation_out_of_range" in issues
+    assert "uncited_source_claims:1" in issues
+
+
+def test_hira_and_mfds_routes_require_a_clear_subject() -> None:
+    tools = {"hira_updates_search", "openapi_mfds_check_drug_permission"}
+
+    hira = _deterministic_structured_request(
+        "심평원에서 키트루다 비소세포폐암 항암제 급여 기준을 알려줘", tools
+    )
+    assert hira is not None
+    assert hira[0] == "hira_updates_search"
+    assert hira[1]["current_only"] is True
+    assert hira[1]["document_type"] == "cancer_drug_notice"
+    unclear_oncology = _deterministic_structured_request(
+        "심평원에서 비소세포폐암 급여 기준을 알려줘", tools
+    )
+    assert unclear_oncology is not None
+    assert unclear_oncology[1]["document_type"] == "all"
+    assert _deterministic_structured_request("심평원 급여 기준을 알려줘", tools) is None
+    assert _deterministic_structured_request("이 약의 식약처 허가사항은?", tools) is None
+    assert _deterministic_structured_request("키트루다 식약처 허가사항은?", tools) == (
+        "openapi_mfds_check_drug_permission",
+        {"drug_name": "키트루다", "num_rows": 5},
+    )
 
 
 def test_index_followup_prefers_answer_bearing_population_match() -> None:
@@ -360,22 +444,50 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     assert "cite-1" in final_request["messages"][0]["content"]
 
 
-def test_structured_source_route_uses_one_l2_tool_selection() -> None:
-    harness, create, mcp = _harness(
-        [
-            _response(tool_calls=[_call("kcd_search_codes", '{"query":"당뇨병"}')]),
-            _response(content="E11 [1]"),
-        ]
-    )
+def test_structured_source_route_skips_l2_tool_selection() -> None:
+    harness, create, mcp = _harness([_response(content="E11 [1]")])
 
     answer = asyncio.run(
         harness.chat([{"role": "user", "content": "당뇨병의 정확한 KCD 코드는?"}])
     )
 
     assert answer == "E11 [1]"
-    assert create.await_count == 2
-    assert create.await_args_list[0].kwargs["tool_choice"] == "required"
-    assert mcp.calls == [("kcd_search_codes", {"query": "당뇨병"})]
+    assert create.await_count == 1
+    assert "tools" not in create.await_args.kwargs
+    assert mcp.calls == [
+        (
+            "kcd_search_codes",
+            {"name": "당뇨병", "lang": "auto", "top_k": 5, "revision": "latest"},
+        )
+    ]
+
+
+def test_mfds_detail_route_checks_permission_then_indication() -> None:
+    harness, create, mcp = _harness([_response(content="허가 적응증 답변 [1] [2]")])
+
+    answer = asyncio.run(
+        harness.chat(
+            [{"role": "user", "content": "키트루다 식약처 허가사항과 용법용량을 알려줘"}]
+        )
+    )
+
+    assert answer == "허가 적응증 답변 [1] [2]"
+    assert create.await_count == 1
+    assert mcp.calls == [
+        (
+            "openapi_mfds_check_drug_permission",
+            {"drug_name": "키트루다", "num_rows": 5},
+        ),
+        (
+            "openapi_mfds_get_drug_indication",
+            {
+                "drug_name": "키트루다",
+                "num_rows": 3,
+                "include_dosage": True,
+                "notice_clause": "투여하지 말",
+            },
+        ),
+    ]
 
 
 def test_retrieval_failure_still_runs_final_l2_generation() -> None:
