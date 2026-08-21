@@ -20,7 +20,7 @@ from .prompts import (
 from .ranking import CITE_PATTERN, rank_documents
 
 GUIDELINE_INDEX_PATTERN = re.compile(
-    r"\b(?:clinical guidelines?|according to (?:the )?guideline|consensus statement)\b|"
+    r"\b(?:guidelines?|consensus statement)\b|"
     r"가이드라인|진료\s*지침|권고안",
     re.IGNORECASE,
 )
@@ -30,6 +30,16 @@ OTHER_OFFICIAL_SOURCE_PATTERN = re.compile(
     r"legal requirement|pubmed|faers)\b|"
     r"심평원|급여\s*기준|비급여|보험\s*기준|식약처|허가\s*사항|약가|"
     r"질병\s*코드|상병\s*코드|법령|법률|시행\s*규칙|근거\s*문헌",
+    re.IGNORECASE,
+)
+GUIDELINE_TIMING_PATTERN = re.compile(
+    r"\b(?:time\s*window|timing|onset|last known well|within\s+\d|hours?)\b|"
+    r"시간\s*창|발병\s*시점|최종\s*정상\s*확인|몇\s*시간",
+    re.IGNORECASE,
+)
+GUIDELINE_SAFETY_PATTERN = re.compile(
+    r"\b(?:contraindicat\w*|exclusion\w*|not eligible|eligibility|precaution\w*|"
+    r"bleeding risk|safety criteria)\b|금기|제외\s*기준|적격\s*기준|주의\s*사항",
     re.IGNORECASE,
 )
 
@@ -549,7 +559,10 @@ def _index_relevant_nodes_arguments(
 
 
 def _deterministic_guideline_request(
-    context: str, available_names: set[str]
+    context: str,
+    available_names: set[str],
+    *,
+    search_query: str | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """Skip an L2 selector when the indexed guideline route is unambiguous."""
     if (
@@ -562,10 +575,38 @@ def _deterministic_guideline_request(
         "index_get_relevant_nodes",
         {
             "corpus_tag": "guideline",
-            "query": _truncate_middle(context, 6_000),
+            "query": _truncate_middle(search_query or context, 6_000),
         },
     )
     return "index_get_relevant_nodes", arguments
+
+
+def _guideline_focus_queries(query: str) -> list[str]:
+    """Split common compound guideline requests into answer-bearing search aspects."""
+    subject_context = re.sub(
+        r"\b\d+(?:\.\d+)?\s*(?:hours?|hrs?)\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    subject_context = GUIDELINE_TIMING_PATTERN.sub(" ", subject_context)
+    subject_context = GUIDELINE_SAFETY_PATTERN.sub(" ", subject_context)
+    subject_context = re.sub(r"\s+", " ", subject_context).strip(" ,.;:-")
+    queries: list[str] = []
+    if GUIDELINE_TIMING_PATTERN.search(query):
+        queries.append(
+            "Exact guideline treatment timing: onset or last-known-well time window, "
+            "extended window, and eligible patient population. Clinical context: "
+            + subject_context
+        )
+    if GUIDELINE_SAFETY_PATTERN.search(query):
+        queries.append(
+            "Main treatment contraindications and exclusion criteria: active bleeding, "
+            "blood pressure, coagulation or platelet thresholds, intracranial history, "
+            "and recent surgery. Clinical context: "
+            + subject_context
+        )
+    return queries[:2]
 
 
 def _kcd_revision(text: str) -> str:
@@ -813,16 +854,38 @@ def _citation_audit(answer: str, evidence_count: int) -> list[str]:
     return issues
 
 
-def _index_page_arguments(
-    query: str, primary_arguments: dict[str, Any], output: str
-) -> dict[str, Any] | None:
-    """Turn an index node result into one bounded page-content follow-up."""
+def _citation_issue_score(issues: list[str]) -> int:
+    """Give high-confidence citation failures a comparable repair score."""
+    score = 0
+    for issue in issues:
+        if issue == "missing_all_citations":
+            score += 10
+        elif issue == "citation_out_of_range":
+            score += 5
+        elif issue.startswith("uncited_source_claims:"):
+            try:
+                score += int(issue.rsplit(":", 1)[1])
+            except ValueError:
+                score += 1
+        else:
+            score += 1
+    return score
+
+
+def _index_page_argument_candidates(
+    query: str,
+    primary_arguments: dict[str, Any],
+    output: str,
+    *,
+    limit: int = 2,
+) -> list[dict[str, Any]]:
+    """Turn ranked index nodes into distinct bounded page-content follow-ups."""
     try:
         nodes = json.loads(output)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return []
     if not isinstance(nodes, list):
-        return None
+        return []
 
     query_tokens = _search_tokens(query)
     requested_years = {
@@ -883,43 +946,74 @@ def _index_page_arguments(
         )
 
     if not ranked:
-        return None
+        return []
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    selected = ranked[0][2]
-    start_page, end_page = selected["range"]
-    if start_page < 1 or end_page < start_page:
-        return None
+    primary_doc_id = ranked[0][2]["doc_id"]
+    ordered = [
+        ranked[0],
+        *(item for item in ranked[1:] if item[2].get("doc_id") == primary_doc_id),
+        *(item for item in ranked[1:] if item[2].get("doc_id") != primary_doc_id),
+    ]
+    arguments: list[dict[str, Any]] = []
+    for _score, _position, selected in ordered:
+        start_page, end_page = selected["range"]
+        if start_page < 1 or end_page < start_page:
+            continue
 
-    # A question can require adjacent sections (for example, a treatment window and
-    # its contraindications). Include nearby, relevant nodes from the same document
-    # while keeping the page request within the MCP's bounded four-page window.
-    selected_doc_id = selected["doc_id"]
-    for _score, _position, candidate in ranked[1:]:
-        if candidate.get("doc_id") != selected_doc_id:
-            continue
-        candidate_range = candidate.get("range")
-        if (
-            not isinstance(candidate_range, list)
-            or len(candidate_range) != 2
-            or not all(isinstance(page, int) for page in candidate_range)
-        ):
-            continue
-        candidate_start, candidate_end = candidate_range
-        if candidate_start < 1 or candidate_end < candidate_start:
-            continue
-        if candidate_start > end_page + 1 or candidate_end < start_page - 1:
-            continue
-        combined_start = min(start_page, candidate_start)
-        combined_end = max(end_page, candidate_end)
-        if combined_end - combined_start + 1 <= 4:
-            start_page, end_page = combined_start, combined_end
+        # Include adjacent nodes from the same document while keeping each MCP page
+        # request within its bounded four-page window.
+        selected_doc_id = selected["doc_id"]
+        for _candidate_score, _candidate_position, candidate in ranked:
+            if candidate is selected or candidate.get("doc_id") != selected_doc_id:
+                continue
+            candidate_range = candidate.get("range")
+            if (
+                not isinstance(candidate_range, list)
+                or len(candidate_range) != 2
+                or not all(isinstance(page, int) for page in candidate_range)
+            ):
+                continue
+            candidate_start, candidate_end = candidate_range
+            if candidate_start < 1 or candidate_end < candidate_start:
+                continue
+            if candidate_start > end_page + 1 or candidate_end < start_page - 1:
+                continue
+            combined_start = min(start_page, candidate_start)
+            combined_end = max(end_page, candidate_end)
+            if combined_end - combined_start + 1 <= 4:
+                start_page, end_page = combined_start, combined_end
 
-    return {
-        "corpus_tag": primary_arguments.get("corpus_tag", "guideline"),
-        "doc_id": selected_doc_id,
-        "start_page": start_page,
-        "end_page": min(end_page, start_page + 3),
-    }
+        page_arguments = {
+            "corpus_tag": primary_arguments.get("corpus_tag", "guideline"),
+            "doc_id": selected_doc_id,
+            "start_page": start_page,
+            "end_page": min(end_page, start_page + 3),
+        }
+        overlaps_existing = any(
+            existing["doc_id"] == page_arguments["doc_id"]
+            and existing["start_page"] <= page_arguments["end_page"]
+            and page_arguments["start_page"] <= existing["end_page"]
+            for existing in arguments
+        )
+        if overlaps_existing:
+            continue
+        arguments.append(page_arguments)
+        if len(arguments) >= max(1, limit):
+            break
+    return arguments
+
+
+def _index_page_arguments(
+    query: str, primary_arguments: dict[str, Any], output: str
+) -> dict[str, Any] | None:
+    """Turn an index node result into one bounded page-content follow-up."""
+    candidates = _index_page_argument_candidates(
+        query,
+        primary_arguments,
+        output,
+        limit=1,
+    )
+    return candidates[0] if candidates else None
 
 
 class L2Harness:
@@ -961,9 +1055,15 @@ class L2Harness:
             return ""
         return output
 
-    async def retrieve(self, messages: list[dict[str, str]]) -> RetrievalResult:
+    async def retrieve(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        routing_context: str = "",
+    ) -> RetrievalResult:
         started = time.monotonic()
         context = _conversation_context(messages)
+        routing_text = f"{routing_context}\n\n{context}".strip()
         latest_user_text = _latest_user_text(messages)
         search_text = f"{context}\n\nSEARCH HINTS: {_retrieval_hints(context)}"
         retrieval_messages: list[dict[str, Any]] = [
@@ -1056,14 +1156,25 @@ class L2Harness:
                 )
                 return finalized
 
+            guideline_focus_queries = _guideline_focus_queries(context)
             deterministic = _deterministic_guideline_request(
-                context, available_names
+                routing_text,
+                available_names,
+                search_query=context,
             ) or _deterministic_structured_request(latest_user_text, available_names)
             primary_name: str | None = None
             primary_arguments: dict[str, Any] = {}
             primary_output = ""
             if deterministic:
                 primary_name, primary_arguments = deterministic
+                if primary_name == "index_get_relevant_nodes" and guideline_focus_queries:
+                    primary_arguments = _prepare_primary_arguments(
+                        primary_name,
+                        {
+                            "corpus_tag": "guideline",
+                            "query": guideline_focus_queries[0],
+                        },
+                    )
                 _log(
                     "retrieval_primary_selected",
                     strategy="deterministic",
@@ -1151,23 +1262,72 @@ class L2Harness:
                             )
                         )
             elif primary_output and primary_name == "index_get_relevant_nodes":
-                followup_arguments = _index_page_arguments(
+                followup_candidates = _index_page_argument_candidates(
                     f"{search_text}\n{primary_arguments.get('query', '')}",
                     primary_arguments,
                     primary_output,
+                    limit=(
+                        1
+                        if len(guideline_focus_queries) > 1
+                        else min(
+                            2,
+                            max(1, self.settings.max_retrieval_calls - tool_calls),
+                        )
+                    ),
                 )
-                if (
-                    followup_arguments
-                    and "index_get_page_content" in available_names
-                    and tool_calls < self.settings.max_retrieval_calls
+                for position, followup_arguments in enumerate(
+                    followup_candidates, start=2
                 ):
+                    if (
+                        "index_get_page_content" not in available_names
+                        or tool_calls >= self.settings.max_retrieval_calls
+                    ):
+                        break
                     await run_mcp_action(
                         _RequestedToolCall(
-                            call_id="retrieval-index-page-2",
+                            call_id=f"retrieval-index-page-{position}",
                             name="index_get_page_content",
                             arguments=followup_arguments,
                         )
                     )
+                if (
+                    len(guideline_focus_queries) > 1
+                    and "index_get_relevant_nodes" in available_names
+                    and "index_get_page_content" in available_names
+                    and tool_calls + 2 <= self.settings.max_retrieval_calls
+                ):
+                    secondary_arguments = _prepare_primary_arguments(
+                        "index_get_relevant_nodes",
+                        {
+                            "corpus_tag": "guideline",
+                            "query": guideline_focus_queries[1],
+                        },
+                    )
+                    _log(
+                        "retrieval_secondary_selected",
+                        strategy="compound_guideline",
+                        aspect="safety",
+                    )
+                    secondary_output = await run_mcp_action(
+                        _RequestedToolCall(
+                            call_id="retrieval-secondary-nodes-3",
+                            name="index_get_relevant_nodes",
+                            arguments=secondary_arguments,
+                        )
+                    )
+                    secondary_page = _index_page_arguments(
+                        guideline_focus_queries[1],
+                        secondary_arguments,
+                        secondary_output,
+                    )
+                    if secondary_page is not None:
+                        await run_mcp_action(
+                            _RequestedToolCall(
+                                call_id="retrieval-secondary-page-4",
+                                name="index_get_page_content",
+                                arguments=secondary_page,
+                            )
+                        )
             elif primary_name == "openapi_mfds_check_drug_permission":
                 indication_arguments = _mfds_indication_arguments(
                     latest_user_text, str(primary_arguments.get("drug_name", ""))
@@ -1193,8 +1353,15 @@ class L2Harness:
                         for cite_uid in CITE_PATTERN.findall(document)
                     )
                 )
-                citable_context = _truncate_middle(
-                    "\n\n".join(citable_documents),
+                finalize_evidence = rank_documents(
+                    context,
+                    citable_documents,
+                    self.settings.retrieval_top_k,
+                )
+                citable_context = RetrievalResult(
+                    status="partial" if finalize_evidence else "no_evidence",
+                    evidence=finalize_evidence,
+                ).for_generation(
                     self.settings.max_evidence_chars,
                 )
                 finalize_messages: list[dict[str, Any]] = [
@@ -1212,32 +1379,53 @@ class L2Harness:
                         ),
                     },
                 ]
-                finalize_response = await self.client.chat.completions.create(
-                    model=self.settings.model,
-                    messages=finalize_messages,
-                    tools=[FINALIZE_RETRIEVAL_TOOL],
-                    tool_choice="required",
-                    temperature=0,
-                    max_tokens=self.settings.retrieval_max_tokens,
+                finalize_remaining_sec = (
+                    self.settings.retrieval_timeout_sec
+                    - (time.monotonic() - started)
+                    - 1
                 )
-                finalize_calls = _requested_tool_calls(
-                    finalize_response.choices[0].message, 2
-                )
-                _log(
-                    "retrieval_round",
-                    round=2,
-                    requested_calls=len(finalize_calls),
-                )
-                selected_finalize = next(
-                    (
-                        call
-                        for call in finalize_calls
-                        if call.name == "finalize_retrieval"
-                    ),
-                    None,
-                )
-                if selected_finalize is not None:
-                    selection = accept_finalize(selected_finalize)
+                if finalize_remaining_sec < 2:
+                    _log(
+                        "retrieval_finalize_skipped",
+                        reason="insufficient_time",
+                        remaining_ms=max(0, round(finalize_remaining_sec * 1_000)),
+                    )
+                else:
+                    try:
+                        async with asyncio.timeout(finalize_remaining_sec):
+                            finalize_response = await self.client.chat.completions.create(
+                                model=self.settings.model,
+                                messages=finalize_messages,
+                                tools=[FINALIZE_RETRIEVAL_TOOL],
+                                tool_choice="required",
+                                temperature=0,
+                                max_tokens=self.settings.retrieval_max_tokens,
+                            )
+                    except TimeoutError:
+                        _log(
+                            "retrieval_finalize_skipped",
+                            reason="timeout",
+                            remaining_ms=0,
+                        )
+                    else:
+                        finalize_calls = _requested_tool_calls(
+                            finalize_response.choices[0].message, 2
+                        )
+                        _log(
+                            "retrieval_round",
+                            round=2,
+                            requested_calls=len(finalize_calls),
+                        )
+                        selected_finalize = next(
+                            (
+                                call
+                                for call in finalize_calls
+                                if call.name == "finalize_retrieval"
+                            ),
+                            None,
+                        )
+                        if selected_finalize is not None:
+                            selection = accept_finalize(selected_finalize)
 
         if selection is not None and selection.status == "no_evidence":
             result = RetrievalResult(
@@ -1362,26 +1550,42 @@ class L2Harness:
         )
 
     async def _generate(
-        self, system_prompt: str, messages: list[dict[str, Any]]
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
     ) -> str:
         last_finish_reason: str | None = None
+        base_max_tokens = min(
+            self.settings.generation_max_tokens,
+            max_tokens or self.settings.generation_max_tokens,
+        )
         for attempt in range(3):
             attempt_prompt = system_prompt
-            attempt_max_tokens = self.settings.generation_max_tokens
+            attempt_max_tokens = base_max_tokens
             attempt_messages = messages
             if attempt:
-                recovery = (
-                    "RECOVERY INSTRUCTION: A previous generation attempt returned no usable "
-                    "answer. Return a non-empty, concise, complete medical answer to the latest "
-                    "user question now, in the user's language. If a required detail is genuinely "
-                    "missing, ask one short clarifying question. Do not return tool calls, hidden "
-                    "reasoning, or an empty response."
-                )
+                if last_finish_reason == "length":
+                    recovery = (
+                        "RECOVERY INSTRUCTION: The previous draft was cut off. Rewrite the entire "
+                        "answer from the beginning in at most 180 words. Prioritize every part of "
+                        "the user's question and essential safety details. Return only a complete "
+                        "answer ending at a sentence boundary, with grounded citations."
+                    )
+                else:
+                    recovery = (
+                        "RECOVERY INSTRUCTION: A previous generation attempt returned no usable "
+                        "answer. Return a non-empty, concise, complete medical answer to the latest "
+                        "user question now, in the user's language. If a required detail is genuinely "
+                        "missing, ask one short clarifying question. Do not return tool calls, hidden "
+                        "reasoning, or an empty response."
+                    )
                 attempt_prompt = system_prompt + "\n\n" + recovery
                 attempt_max_tokens = (
-                    2_048
+                    min(base_max_tokens, 768)
                     if last_finish_reason == "length"
-                    else min(attempt_max_tokens, 512)
+                    else min(base_max_tokens, 512)
                 )
                 attempt_messages = _answer_only_retry_messages(messages)
             try:
@@ -1409,7 +1613,16 @@ class L2Harness:
             native_tool_calls = choice.message.tool_calls or []
             text_tool_calls = list(TEXT_TOOL_CALL_PATTERN.finditer(content))
             if content.strip() and not native_tool_calls and not text_tool_calls:
-                return content
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason != "length" or attempt == 2:
+                    return content
+                last_finish_reason = finish_reason
+                _log(
+                    "final_generation_truncated",
+                    attempt=attempt + 1,
+                    answer_chars=len(content),
+                )
+                continue
             last_finish_reason = getattr(choice, "finish_reason", None)
             if native_tool_calls or text_tool_calls:
                 _log(
@@ -1433,9 +1646,57 @@ class L2Harness:
             )
         raise RuntimeError("L2 returned no usable answer within the bounded retry budget")
 
+    async def _repair_citations(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        draft: str,
+        issues: list[str],
+        evidence_count: int,
+    ) -> str | None:
+        repair_prompt = (
+            system_prompt
+            + "\n\nCITATION REPAIR MODE: Revise the supplied draft once. Preserve correct, "
+            "useful content and the user's language. Add an in-range [n] citation only when "
+            "the supplied evidence directly supports the claim. Delete or qualify unsupported "
+            "source-specific claims. Remove out-of-range citations. Return the complete revised "
+            "user-facing answer only, with no explanation of the repair and no tool calls."
+        )
+        repair_messages = [
+            *_answer_only_retry_messages(messages),
+            {"role": "assistant", "content": draft},
+            {
+                "role": "user",
+                "content": (
+                    "Repair the draft's citation problems. Valid citation numbers are "
+                    + (f"[1] through [{evidence_count}]" if evidence_count else "none")
+                    + ". Detected problems: "
+                    + ", ".join(issues)
+                    + "."
+                ),
+            },
+        ]
+        response = await self.client.chat.completions.create(
+            model=self.settings.model,
+            messages=[{"role": "system", "content": repair_prompt}, *repair_messages],
+            temperature=0,
+            max_tokens=min(self.settings.generation_max_tokens, 512),
+        )
+        message = response.choices[0].message
+        content = message.content or ""
+        if (
+            not content.strip()
+            or message.tool_calls
+            or TEXT_TOOL_CALL_PATTERN.search(content)
+        ):
+            return None
+        return content
+
     async def chat(self, messages: list[dict[str, str]]) -> str:
         if not messages or messages[-1].get("role") != "user":
             raise ValueError("messages must end with a user message")
+
+        turn_started = time.monotonic()
 
         compact_messages = _compact_messages(
             messages,
@@ -1446,9 +1707,28 @@ class L2Harness:
             messages[-1]["content"]
         )
 
-        memory_answer, retrieval_request = await self._start_generation(
-            generation_prompt, compact_messages
+        user_routing_context = "\n\n".join(
+            message["content"]
+            for message in compact_messages
+            if message.get("role") == "user"
         )
+        if GUIDELINE_INDEX_PATTERN.search(
+            user_routing_context
+        ) and not OTHER_OFFICIAL_SOURCE_PATTERN.search(user_routing_context):
+            memory_answer = None
+            retrieval_request = _GenerationRetrievalRequest(
+                call_id="generation-deterministic-guideline",
+                query=_truncate_middle(_conversation_context(compact_messages), 6_000),
+            )
+            _log(
+                "generation_retrieval_forced",
+                strategy="explicit_guideline",
+                query_chars=len(retrieval_request.query),
+            )
+        else:
+            memory_answer, retrieval_request = await self._start_generation(
+                generation_prompt, compact_messages
+            )
         if memory_answer is not None:
             _log("generation_memory_answer")
             return memory_answer
@@ -1462,7 +1742,8 @@ class L2Harness:
         try:
             async with asyncio.timeout(self.settings.retrieval_timeout_sec):
                 retrieval = await self.retrieve(
-                    [{"role": "user", "content": retrieval_request.query}]
+                    [{"role": "user", "content": retrieval_request.query}],
+                    routing_context=user_routing_context,
                 )
         except Exception as exc:  # noqa: BLE001 - preserve final generation on MCP failure
             _log("retrieval_unavailable", error_type=type(exc).__name__)
@@ -1473,16 +1754,17 @@ class L2Harness:
 
         if retrieval.evidence:
             grounding_rules = (
-                "Citable evidence is present. Answer the source-specific question using ONLY "
-                "claims supported by the numbered evidence blocks. You MUST put [1], [2], etc. "
-                "immediately after every source-specific recommendation, number, and source "
-                "description. Do not mention or infer any guideline, authority, study, threshold, "
-                "or statistic absent from the evidence. If the evidence is incomplete, state only "
-                "that limitation instead of filling the gap from memory. Keep the grounded answer "
-                "focused and under 350 words. Before returning, silently audit the final draft: "
-                "every official decision, KCD code, dosage, threshold, date, price, and other "
-                "source-specific number must carry an in-range citation in the same sentence. "
-                "Delete an unsupported claim or state the limitation."
+                "Citable evidence is present. Use the numbered evidence blocks for every claim "
+                "you attribute to a named guideline or other official source, and put [1], [2], "
+                "etc. immediately after that supported claim. Never invent a source-specific "
+                "class, level of evidence, date, threshold, or statistic. If retrieval is partial, "
+                "do not omit clinically essential safety information requested by the user: add "
+                "well-established medical knowledge as clearly labeled general clinical context, "
+                "without a citation and without attributing it to the retrieved source. Distinguish "
+                "the retrieval limitation briefly, but still answer every part of the question. "
+                "Keep the answer focused and under 250 words. Before returning, silently audit "
+                "that citations are in range and that every requested safety-critical item is "
+                "addressed."
             )
         else:
             grounding_rules = (
@@ -1507,7 +1789,32 @@ class L2Harness:
                 "content": retrieval.for_generation(self.settings.max_evidence_chars),
             },
         ]
-        answer = await self._generate(grounded_prompt, generation_messages)
+        final_generation_started = time.monotonic()
+        final_max_tokens = min(self.settings.generation_max_tokens, 1_536)
+        _log(
+            "final_generation_started",
+            max_tokens=final_max_tokens,
+            remaining_ms=max(
+                0,
+                round(
+                    (
+                        self.settings.turn_timeout_sec
+                        - (final_generation_started - turn_started)
+                    )
+                    * 1_000
+                ),
+            ),
+        )
+        answer = await self._generate(
+            grounded_prompt,
+            generation_messages,
+            max_tokens=final_max_tokens,
+        )
+        _log(
+            "final_generation_completed",
+            elapsed_ms=round((time.monotonic() - final_generation_started) * 1_000),
+            answer_chars=len(answer),
+        )
         citation_issues = _citation_audit(answer, len(retrieval.evidence))
         _log(
             "citation_audit_completed",
@@ -1515,4 +1822,64 @@ class L2Harness:
             issues=citation_issues,
             evidence_count=len(retrieval.evidence),
         )
+        if citation_issues and not retrieval.evidence:
+            _log(
+                "citation_repair_skipped",
+                reason="no_evidence",
+            )
+        elif citation_issues and retrieval.status == "partial":
+            _log(
+                "citation_repair_skipped",
+                reason="partial_evidence",
+            )
+        elif citation_issues:
+            remaining_sec = (
+                self.settings.turn_timeout_sec
+                - (time.monotonic() - turn_started)
+                - 1
+            )
+            repair_timeout_sec = min(10.0, remaining_sec)
+            if repair_timeout_sec < 3:
+                _log(
+                    "citation_repair_skipped",
+                    reason="insufficient_time",
+                    remaining_ms=max(0, round(remaining_sec * 1_000)),
+                )
+            else:
+                _log(
+                    "citation_repair_started",
+                    issues=citation_issues,
+                    timeout_ms=round(repair_timeout_sec * 1_000),
+                )
+                try:
+                    async with asyncio.timeout(repair_timeout_sec):
+                        repaired = await self._repair_citations(
+                            grounded_prompt,
+                            generation_messages,
+                            answer,
+                            citation_issues,
+                            len(retrieval.evidence),
+                        )
+                except Exception as exc:  # noqa: BLE001 - keep the usable original answer
+                    _log(
+                        "citation_repair_failed",
+                        error_type=type(exc).__name__,
+                    )
+                else:
+                    repaired_issues = (
+                        _citation_audit(repaired, len(retrieval.evidence))
+                        if repaired is not None
+                        else citation_issues
+                    )
+                    adopted = repaired is not None and _citation_issue_score(
+                        repaired_issues
+                    ) < _citation_issue_score(citation_issues)
+                    _log(
+                        "citation_repair_completed",
+                        adopted=adopted,
+                        issues_before=citation_issues,
+                        issues_after=repaired_issues,
+                    )
+                    if adopted:
+                        answer = repaired
         return answer

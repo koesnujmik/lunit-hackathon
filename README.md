@@ -7,16 +7,23 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
 
 1. 첫 user 질문과 최근 5개 message를 유지하고 message별 길이를 제한합니다.
 2. Generation L2에는 `retrieve_relevant_content` 하나만 제공하며, L2가 memory로 직접
-   답할지 self-contained query로 retrieval을 요청할지 결정합니다.
+   답할지 self-contained query로 retrieval을 요청할지 결정합니다. 단, 사용자가
+   guideline을 명시한 질문은 검색 필요성이 확정적이므로 판단용 L2 호출을 생략합니다.
 3. Retrieval 결과는 `role=tool` message로 같은 generation 대화에 전달하고 최종 답변을
    생성합니다.
 4. Retrieval L2에는 실제 MCP tools와 `finalize_retrieval`을 함께 제공합니다. Guideline은
    결정적 2-step index 조회를 사용하고, 문서 목록을 선택한 경우에는 목록→관련 node→page
    content 순서를 코드가 이어서 실행합니다.
-5. MCP tool은 최대 3회 호출한 뒤 L2가 `finalize_retrieval`로 `status`, `note`, 관련
+5. MCP tool은 최대 4회 호출한 뒤 L2가 `finalize_retrieval`로 `status`, `note`, 관련
    `cite_uid`를 제출하며, 목록이나 node 요약이 아닌 실제 citation 본문만 generation에
-   전달합니다.
-6. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
+   전달합니다. 남은 검색 시간이 부족해 finalize를 끝내지 못해도 이미 확보한
+   `cite_uid`와 본문은 bounded fallback으로 보존합니다.
+6. 인용 가능한 검색 근거가 있고 최종 답변의 citation audit가 실패한 경우에만 남은
+   시간 안에서 한 번 교정하고, citation 문제가 줄어든 경우에만 교정본을 채택합니다.
+   Partial evidence에서 보충한 필수 안전 정보는 인용 교정이 삭제하지 않도록 보존합니다.
+7. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
+   검색 기반 최종 답변은 최대 1,536토큰으로 제한하고, 잘린 답변은 더 짧게 한 번
+   재작성해 완결성과 generation 시간을 함께 관리합니다.
 
 동시에 최대 8개 turn을 처리하며, 대기열에서 기다린 시간은 실제 turn의 55초 처리 제한에
 포함하지 않습니다.

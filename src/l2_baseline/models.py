@@ -43,14 +43,29 @@ class RetrievalResult(BaseModel):
         lines = [f"status: {self.status}"]
         if self.note:
             lines.append(f"note: {self.note}")
+        fixed_chars = len("\n".join(lines)) + len(self.evidence) * 96
+        content_budget = max(0, max_chars - fixed_chars)
+        per_item_budget = content_budget // max(1, len(self.evidence))
         for index, item in enumerate(self.evidence, 1):
+            content = item.content
+            if len(content) > per_item_budget:
+                marker = "\n...[evidence truncated]...\n"
+                if per_item_budget <= len(marker):
+                    content = content[:per_item_budget]
+                else:
+                    available = per_item_budget - len(marker)
+                    head = (available * 2) // 3
+                    tail = available - head
+                    content = (
+                        content[:head] + marker + (content[-tail:] if tail else "")
+                    )
             lines.extend(
                 [
                     "",
                     f"[{index}]",
                     f"cite_uid: {item.cite_uid}",
                     f"relevance_score: {item.relevance_score:.2f}",
-                    item.content,
+                    content,
                 ]
             )
         if not self.evidence:

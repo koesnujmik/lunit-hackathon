@@ -14,11 +14,14 @@ from l2_baseline.harness import (
     _compact_messages,
     _deterministic_guideline_request,
     _deterministic_structured_request,
+    _guideline_focus_queries,
+    _index_page_argument_candidates,
     _index_page_arguments,
     _index_relevant_nodes_arguments,
     _prepare_primary_arguments,
     _response_language_instruction,
 )
+from l2_baseline.models import Evidence, RetrievalResult
 
 
 def _tool(name: str, description: str) -> dict[str, Any]:
@@ -167,6 +170,50 @@ class DocumentChainMCP(FakeMCP):
         return ""
 
 
+class CompoundGuidelineMCP(FakeMCP):
+    async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        self.calls.append((name, arguments))
+        if name == "index_get_relevant_nodes":
+            if "contraindications" in str(arguments.get("query", "")):
+                return json.dumps(
+                    [
+                        {
+                            "doc_id": "stroke-safety",
+                            "range": [42, 44],
+                            "title": "Alteplase contraindications and exclusions",
+                            "summary": "Bleeding, blood pressure, INR, platelet, and surgery exclusions.",
+                            "score": 0.96,
+                        }
+                    ]
+                )
+            return json.dumps(
+                [
+                    {
+                        "doc_id": "stroke-window",
+                        "range": [18, 20],
+                        "title": "Alteplase treatment window",
+                        "summary": "Treatment within 4.5 hours for selected patients.",
+                        "score": 0.95,
+                    }
+                ]
+            )
+        if name == "index_get_page_content":
+            if arguments.get("doc_id") == "stroke-safety":
+                return json.dumps(
+                    {
+                        "cite_uid": "cite-safety",
+                        "content": "Main alteplase contraindications and exclusion criteria.",
+                    }
+                )
+            return json.dumps(
+                {
+                    "cite_uid": "cite-window",
+                    "content": "Selected patients may receive alteplase within 4.5 hours.",
+                }
+            )
+        return ""
+
+
 def _harness(
     responses: list[object], mcp: FakeMCP | None = None
 ) -> tuple[L2Harness, AsyncMock, FakeMCP]:
@@ -252,8 +299,43 @@ def test_unambiguous_guideline_route_skips_tool_selector() -> None:
     assert request[0] == "index_get_relevant_nodes"
     assert request[1]["corpus_tag"] == "guideline"
     assert _deterministic_guideline_request(
+        "AHA/ASA 2019 guideline alteplase window and contraindications",
+        {"index_get_relevant_nodes"},
+    ) is not None
+    assert _deterministic_guideline_request(
         "심평원 급여 기준 가이드라인", {"index_get_relevant_nodes"}
     ) is None
+
+
+def test_original_guideline_context_routes_a_rewritten_query_directly() -> None:
+    harness, create, mcp = _harness([_finalize_response()])
+
+    result = asyncio.run(
+        harness.retrieve(
+            [{"role": "user", "content": "alteplase dosing recommendation"}],
+            routing_context="What does the AHA/ASA 2019 guideline recommend?",
+        )
+    )
+
+    assert result.status == "sufficient"
+    assert create.await_count == 1
+    assert [name for name, _arguments in mcp.calls] == [
+        "index_get_relevant_nodes",
+        "index_get_page_content",
+    ]
+    assert "alteplase dosing recommendation" in mcp.calls[0][1]["query"]
+
+
+def test_compound_guideline_query_is_split_into_timing_and_safety() -> None:
+    queries = _guideline_focus_queries(
+        "AHA guideline: give the 4.5 hour treatment window and main contraindications"
+    )
+
+    assert len(queries) == 2
+    assert "treatment timing" in queries[0]
+    assert "last-known-well" in queries[0]
+    assert "contraindications" in queries[1]
+    assert "coagulation" in queries[1]
 
 
 def test_structured_routes_use_exact_tool_schemas() -> None:
@@ -366,6 +448,43 @@ def test_index_followup_prefers_answer_bearing_population_match() -> None:
         "start_page": 20,
         "end_page": 23,
     }
+
+
+def test_index_followup_can_open_two_distinct_aspects() -> None:
+    nodes = [
+        {
+            "doc_id": "stroke-guide",
+            "range": [18, 20],
+            "title": "Alteplase treatment window",
+            "summary": "Selected patients may receive alteplase within 4.5 hours.",
+            "score": 0.95,
+        },
+        {
+            "doc_id": "stroke-guide",
+            "range": [42, 44],
+            "title": "Alteplase contraindications and exclusions",
+            "summary": "Bleeding, blood pressure, platelet, INR, and surgery exclusions.",
+            "score": 0.93,
+        },
+        {
+            "doc_id": "unrelated-guide",
+            "range": [3, 4],
+            "title": "Aspirin after stroke",
+            "summary": "Antiplatelet treatment after ischemic stroke.",
+            "score": 0.4,
+        },
+    ]
+
+    candidates = _index_page_argument_candidates(
+        "AHA guideline alteplase 4.5 hour window and main contraindications",
+        {"corpus_tag": "guideline"},
+        json.dumps(nodes),
+        limit=2,
+    )
+
+    assert len(candidates) == 2
+    assert {item["start_page"] for item in candidates} == {18, 42}
+    assert {item["doc_id"] for item in candidates} == {"stroke-guide"}
 
 
 def test_index_followup_honors_current_source_request() -> None:
@@ -503,22 +622,8 @@ def test_empty_then_transient_500_can_recover_within_local_budget() -> None:
 def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     harness, create, mcp = _harness(
         [
-            _response(
-                tool_calls=[
-                    _call(
-                        "retrieve_relevant_content",
-                        json.dumps(
-                            {
-                                "query": (
-                                    "current clinical guideline CKD blood pressure target"
-                                )
-                            }
-                        ),
-                    )
-                ]
-            ),
             _finalize_response(),
-            _response(content="grounded answer"),
+            _response(content="grounded answer [1]"),
         ]
     )
 
@@ -533,8 +638,8 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
         )
     )
 
-    assert answer == "grounded answer"
-    assert create.await_count == 3
+    assert answer == "grounded answer [1]"
+    assert create.await_count == 2
     assert len(mcp.calls) == 2
     assert [name for name, _arguments in mcp.calls] == [
         "index_get_relevant_nodes",
@@ -542,21 +647,19 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     ]
     assert mcp.calls[0][1]["corpus_tag"] == "guideline"
     assert mcp.calls[0][1]["k"] == 8
-    assert "CKD blood pressure target" in mcp.calls[0][1]["query"]
+    assert "CKD BP target" in mcp.calls[0][1]["query"]
     assert mcp.calls[1][1] == {
         "corpus_tag": "guideline",
         "doc_id": "ckd-guide",
         "start_page": 12,
         "end_page": 14,
     }
-    decision_request = create.await_args_list[0].kwargs
-    assert decision_request["tool_choice"] == "auto"
-    finalize_request = create.await_args_list[1].kwargs
+    finalize_request = create.await_args_list[0].kwargs
     assert finalize_request["tool_choice"] == "required"
     assert [tool["function"]["name"] for tool in finalize_request["tools"]] == [
         "finalize_retrieval"
     ]
-    final_request = create.await_args_list[2].kwargs
+    final_request = create.await_args_list[1].kwargs
     assert "tool_choice" not in final_request
     assert "tools" not in final_request
     assert "Return only the final user-facing medical answer" in final_request[
@@ -565,6 +668,154 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     assert final_request["messages"][-2]["role"] == "assistant"
     assert final_request["messages"][-1]["role"] == "tool"
     assert "cite-1" in final_request["messages"][-1]["content"]
+    assert final_request["max_tokens"] == 1_536
+    assert "general clinical context" in final_request["messages"][0]["content"]
+    assert "answer every part" in final_request["messages"][0]["content"]
+
+
+def test_citation_repair_adopts_only_an_improved_grounded_answer() -> None:
+    harness, create, _mcp = _harness(
+        [
+            _response(content="The guideline recommends a target below 120 mmHg."),
+            _response(
+                content="The guideline recommends a target below 120 mmHg [1]."
+            ),
+        ]
+    )
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="sufficient",
+            evidence=[
+                Evidence(
+                    cite_uid="cite-1",
+                    relevance_score=0.95,
+                    content="Treat to a systolic blood pressure target below 120 mmHg.",
+                )
+            ],
+            tool_calls=2,
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What target does the current CKD guideline recommend?",
+                }
+            ]
+        )
+    )
+
+    assert answer == "The guideline recommends a target below 120 mmHg [1]."
+    assert create.await_count == 2
+    repair_request = create.await_args_list[1].kwargs
+    assert "tools" not in repair_request
+    assert repair_request["max_tokens"] == 512
+    assert "CITATION REPAIR MODE" in repair_request["messages"][0]["content"]
+    assert "missing_all_citations" in repair_request["messages"][-1]["content"]
+
+
+def test_citation_repair_keeps_original_when_rewrite_is_not_better() -> None:
+    original = "The guideline recommends a target below 120 mmHg."
+    harness, create, _mcp = _harness(
+        [
+            _response(content=original),
+            _response(content="The guideline recommends a target below 130 mmHg."),
+        ]
+    )
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="sufficient",
+            evidence=[
+                Evidence(
+                    cite_uid="cite-1",
+                    relevance_score=0.95,
+                    content="Treat to a systolic blood pressure target below 120 mmHg.",
+                )
+            ],
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What target does the current CKD guideline recommend?",
+                }
+            ]
+        )
+    )
+
+    assert answer == original
+    assert create.await_count == 2
+
+
+def test_citation_repair_is_skipped_without_citable_evidence() -> None:
+    original = "The official source says alteplase is recommended within 4.5 hours."
+    harness, create, _mcp = _harness(
+        [
+            _response(content=original),
+        ]
+    )
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="no_evidence",
+            note="Retrieval timed out before citable evidence was collected.",
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What does the AHA/ASA 2019 guideline recommend?",
+                }
+            ]
+        )
+    )
+
+    assert _citation_audit(original, evidence_count=0)
+    assert answer == original
+    assert create.await_count == 1
+
+
+def test_citation_repair_preserves_general_safety_context_for_partial_evidence() -> None:
+    original = (
+        "The retrieved guideline supports the treatment window [1]. General clinical "
+        "context: confirm BP is below 185 mmHg, platelets above 100,000, and INR no "
+        "higher than 1.7."
+    )
+    harness, create, _mcp = _harness([_response(content=original)])
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="partial",
+            evidence=[
+                Evidence(
+                    cite_uid="cite-1",
+                    relevance_score=0.9,
+                    content="Selected patients may be treated within 4.5 hours.",
+                )
+            ],
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What does the stroke guideline recommend and what is unsafe?",
+                }
+            ]
+        )
+    )
+
+    assert _citation_audit(original, evidence_count=1)
+    assert answer == original
+    assert create.await_count == 1
 
 
 def test_text_tool_call_passes_a_self_contained_multiturn_query_to_retrieval() -> None:
@@ -593,7 +844,7 @@ def test_text_tool_call_passes_a_self_contained_multiturn_query_to_retrieval() -
                 {"role": "assistant", "content": "Understood."},
                 {
                     "role": "user",
-                    "content": "What do current guidelines recommend about it?",
+                    "content": "What does the authoritative source recommend about it?",
                 },
             ]
         )
@@ -618,14 +869,6 @@ def test_final_generation_retries_instead_of_leaking_a_text_tool_call() -> None:
     )
     harness, create, _mcp = _harness(
         [
-            _response(
-                tool_calls=[
-                    _call(
-                        "retrieve_relevant_content",
-                        '{"query":"current clinical guideline CKD blood pressure target"}',
-                    )
-                ]
-            ),
             _finalize_response(),
             _response(content=leaked_tool_call),
             _response(content="Grounded clinical answer [1]."),
@@ -647,8 +890,8 @@ def test_final_generation_retries_instead_of_leaking_a_text_tool_call() -> None:
 
     assert answer == "Grounded clinical answer [1]."
     assert "<tool_call>" not in answer
-    assert create.await_count == 4
-    retry_request = create.await_args_list[3].kwargs
+    assert create.await_count == 3
+    retry_request = create.await_args_list[2].kwargs
     assert "tool_choice" not in retry_request
     assert "tools" not in retry_request
     assert "Do not return tool calls" in retry_request["messages"][0]["content"]
@@ -656,6 +899,49 @@ def test_final_generation_retries_instead_of_leaking_a_text_tool_call() -> None:
     assert "The retrieval stage is complete" in retry_request["messages"][-1][
         "content"
     ]
+
+
+def test_truncated_final_generation_is_rewritten_concisely() -> None:
+    harness, create, _mcp = _harness(
+        [
+            _response(
+                content="The guideline recommends treatment within 4.5 hours, but",
+                finish_reason="length",
+            ),
+            _response(content="Treat selected patients within 4.5 hours [1]."),
+        ]
+    )
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="sufficient",
+            evidence=[
+                Evidence(
+                    cite_uid="cite-1",
+                    relevance_score=0.95,
+                    content="Selected patients may be treated within 4.5 hours.",
+                )
+            ],
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What does the stroke guideline recommend?",
+                }
+            ]
+        )
+    )
+
+    assert answer == "Treat selected patients within 4.5 hours [1]."
+    assert create.await_count == 2
+    assert create.await_args_list[0].kwargs["max_tokens"] == 1_536
+    assert create.await_args_list[1].kwargs["max_tokens"] == 768
+    assert "previous draft was cut off" in create.await_args_list[1].kwargs["messages"][
+        0
+    ]["content"]
 
 
 def test_structured_source_route_skips_l2_tool_selection() -> None:
@@ -700,7 +986,7 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
                 ]
             ),
             _finalize_response(),
-            _response(content="허가 적응증 답변 [1] [2]"),
+            _response(content="허가 적응증 답변 [1]"),
         ]
     )
 
@@ -710,7 +996,7 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
         )
     )
 
-    assert answer == "허가 적응증 답변 [1] [2]"
+    assert answer == "허가 적응증 답변 [1]"
     assert create.await_count == 3
     assert mcp.calls == [
         (
@@ -732,14 +1018,6 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
 def test_retrieval_failure_still_runs_final_l2_generation() -> None:
     harness, create, _mcp = _harness(
         [
-            _response(
-                tool_calls=[
-                    _call(
-                        "retrieve_relevant_content",
-                        '{"query":"exact guideline recommendation"}',
-                    )
-                ]
-            ),
             _response(content="safe answer with limitation"),
         ]
     )
@@ -752,7 +1030,7 @@ def test_retrieval_failure_still_runs_final_l2_generation() -> None:
     )
 
     assert answer == "safe answer with limitation"
-    assert create.await_count == 2
+    assert create.await_count == 1
     assert (
         "Retrieval was unavailable"
         in create.await_args.kwargs["messages"][-1]["content"]
@@ -830,7 +1108,7 @@ def test_document_list_route_opens_relevant_page_before_finalize() -> None:
                     "role": "user",
                     "content": (
                         "intravenous alteplase acute ischemic stroke time window 4.5 hours "
-                        "eligibility criteria contraindications AHA ASA 2019 guideline"
+                        "eligibility criteria contraindications AHA ASA 2019 indexed source"
                     ),
                 }
             ]
@@ -858,6 +1136,64 @@ def test_document_list_route_opens_relevant_page_before_finalize() -> None:
     }
     finalize_request = create.await_args_list[1].kwargs
     assert "cite-stroke" in finalize_request["messages"][-1]["content"]
+
+
+def test_compound_guideline_retrieval_searches_each_aspect_separately() -> None:
+    mcp = CompoundGuidelineMCP()
+    harness, create, _mcp = _harness([_response(content="")], mcp=mcp)
+
+    result = asyncio.run(
+        harness.retrieve(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "According to the AHA guideline, provide the 4.5 hour alteplase "
+                        "window and main contraindications."
+                    ),
+                }
+            ]
+        )
+    )
+
+    assert result.status == "partial"
+    assert {item.cite_uid for item in result.evidence} == {
+        "cite-window",
+        "cite-safety",
+    }
+    assert [name for name, _arguments in mcp.calls] == [
+        "index_get_relevant_nodes",
+        "index_get_page_content",
+        "index_get_relevant_nodes",
+        "index_get_page_content",
+    ]
+    assert "treatment timing" in mcp.calls[0][1]["query"]
+    assert "contraindications" in mcp.calls[2][1]["query"]
+    assert create.await_count == 1
+
+
+def test_retrieval_keeps_collected_evidence_when_finalize_has_no_time() -> None:
+    harness, create, mcp = _harness([])
+    harness.settings.retrieval_timeout_sec = 1
+
+    result = asyncio.run(
+        harness.retrieve(
+            [
+                {
+                    "role": "user",
+                    "content": "According to the guideline, what is the CKD target?",
+                }
+            ]
+        )
+    )
+
+    assert result.status == "partial"
+    assert [item.cite_uid for item in result.evidence] == ["cite-1"]
+    assert create.await_count == 0
+    assert [name for name, _arguments in mcp.calls] == [
+        "index_get_relevant_nodes",
+        "index_get_page_content",
+    ]
 
 
 def test_text_finalize_call_selects_only_resolvable_citations() -> None:
