@@ -42,11 +42,11 @@ class Settings(BaseSettings):
     patient_api_url: str = Field(
         "https://patient.hackathon.lunit.io", alias="LUNIT_PATIENT_API_URL"
     )
-    max_retrieval_calls: int = Field(2, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=2)
+    max_retrieval_calls: int = Field(3, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=3)
     retrieval_top_k: int = Field(3, alias="L2_RETRIEVAL_TOP_K", ge=1, le=10)
     tool_candidate_limit: int = Field(8, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=20)
     retrieval_timeout_sec: float = Field(
-        18, alias="L2_RETRIEVAL_TIMEOUT_SEC", ge=5, le=25
+        25, alias="L2_RETRIEVAL_TIMEOUT_SEC", ge=5, le=25
     )
     max_tool_result_chars: int = Field(
         6_000, alias="L2_MAX_TOOL_RESULT_CHARS", ge=1_000, le=12_000

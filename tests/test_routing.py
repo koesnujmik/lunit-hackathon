@@ -15,6 +15,7 @@ from l2_baseline.harness import (
     _deterministic_guideline_request,
     _deterministic_structured_request,
     _index_page_arguments,
+    _index_relevant_nodes_arguments,
     _prepare_primary_arguments,
     _response_language_instruction,
 )
@@ -77,7 +78,9 @@ def _finalize_response(
 class FakeMCP:
     def __init__(self) -> None:
         self.tools = [
+            _tool("index_list_documents", "List indexed clinical documents"),
             _tool("index_get_relevant_nodes", "Find relevant clinical guideline sections"),
+            _tool("index_get_page_content", "Open indexed document pages"),
             _tool("openapi_law_search", "Search Korean laws"),
             _tool("kcd_search_codes", "Search KCD disease codes"),
             _tool("kcd_get_name", "Get a KCD disease name"),
@@ -106,6 +109,62 @@ class FakeMCP:
                 '"score":0.9}]'
             )
         return '{"cite_uid":"cite-1","content":"retrieved guideline evidence"}'
+
+
+class DocumentChainMCP(FakeMCP):
+    async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        self.calls.append((name, arguments))
+        if name == "index_list_documents":
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "node_id": "stroke-guide",
+                            "title": "2019 AHA/ASA Acute Ischemic Stroke Guideline",
+                            "summary": (
+                                "Intravenous alteplase treatment windows, eligibility, and "
+                                "contraindications for acute ischemic stroke."
+                            ),
+                            "score": 0.91,
+                        },
+                        {
+                            "node_id": "unrelated-guide",
+                            "title": "Unrelated guideline",
+                            "summary": "This guideline does not address thrombolysis.",
+                            "score": 0.2,
+                        },
+                    ]
+                }
+            )
+        if name == "index_get_relevant_nodes":
+            return json.dumps(
+                [
+                    {
+                        "doc_id": "stroke-guide",
+                        "range": [19, 20],
+                        "title": "Time Windows",
+                        "summary": (
+                            "Alteplase within 4.5 hours for eligible patients and the main "
+                            "exclusion criteria."
+                        ),
+                        "score": 0.94,
+                    }
+                ]
+            )
+        if name == "index_get_page_content":
+            return json.dumps(
+                {
+                    "cite_uid": "cite-stroke",
+                    "title": "2019 AHA/ASA Acute Ischemic Stroke Guideline",
+                    "pages": [
+                        {
+                            "page": 19,
+                            "text": "Eligible patients may receive alteplase in the 3–4.5 hour window.",
+                        }
+                    ],
+                }
+            )
+        return ""
 
 
 def _harness(
@@ -149,6 +208,38 @@ def test_index_search_is_bounded_and_expanded() -> None:
 
     assert prepared["k"] == 8
     assert "exact recommendation" in prepared["query"]
+
+
+def test_document_list_selects_a_root_for_relevant_node_search() -> None:
+    output = json.dumps(
+        {
+            "results": [
+                {
+                    "node_id": "unrelated",
+                    "title": "General supportive care",
+                    "summary": "No thrombolysis recommendations.",
+                    "score": 0.7,
+                },
+                {
+                    "node_id": "stroke-guide",
+                    "title": "2019 acute ischemic stroke guideline",
+                    "summary": "Alteplase 4.5 hour window and contraindications.",
+                    "score": 0.8,
+                },
+            ]
+        }
+    )
+
+    arguments = _index_relevant_nodes_arguments(
+        "alteplase acute ischemic stroke 4.5 hour contraindications",
+        {"corpus_tag": "guideline"},
+        output,
+    )
+
+    assert arguments is not None
+    assert arguments["node_id"] == "stroke-guide"
+    assert arguments["corpus_tag"] == "guideline"
+    assert arguments["k"] == 8
 
 
 def test_unambiguous_guideline_route_skips_tool_selector() -> None:
@@ -303,6 +394,45 @@ def test_index_followup_honors_current_source_request() -> None:
 
     assert arguments is not None
     assert arguments["doc_id"] == "newer"
+
+
+def test_index_followup_combines_adjacent_complementary_sections() -> None:
+    nodes = [
+        {
+            "doc_id": "stroke-guide",
+            "range": [19, 20],
+            "title": "Time Windows",
+            "summary": "Alteplase treatment within 4.5 hours for eligible patients.",
+            "score": 0.8,
+        },
+        {
+            "doc_id": "stroke-guide",
+            "range": [21, 22],
+            "title": "Bleeding Risk",
+            "summary": "Contraindications and exclusions for intravenous alteplase.",
+            "score": 0.7,
+        },
+        {
+            "doc_id": "stroke-guide",
+            "range": [33, 34],
+            "title": "Antiplatelet Treatment",
+            "summary": "Aspirin after stroke.",
+            "score": 0.6,
+        },
+    ]
+
+    arguments = _index_page_arguments(
+        "alteplase 4.5 hour window and main contraindications",
+        {"corpus_tag": "guideline"},
+        json.dumps(nodes),
+    )
+
+    assert arguments == {
+        "corpus_tag": "guideline",
+        "doc_id": "stroke-guide",
+        "start_page": 19,
+        "end_page": 22,
+    }
 
 
 def test_direct_route_uses_one_l2_call() -> None:
@@ -666,6 +796,68 @@ def test_retrieval_model_sees_all_mcp_tools_plus_finalize() -> None:
         tool["function"]["name"]
         for tool in create.await_args_list[1].kwargs["tools"]
     ] == ["finalize_retrieval"]
+
+
+def test_document_list_route_opens_relevant_page_before_finalize() -> None:
+    mcp = DocumentChainMCP()
+    harness, create, _mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "index_list_documents",
+                        json.dumps(
+                            {
+                                "corpus_tag": "guideline",
+                                "query": (
+                                    "intravenous alteplase acute ischemic stroke 4.5 hour "
+                                    "window and contraindications AHA ASA 2019 guideline"
+                                ),
+                            }
+                        ),
+                    )
+                ]
+            ),
+            _finalize_response(cite_uid="cite-stroke"),
+        ],
+        mcp=mcp,
+    )
+
+    result = asyncio.run(
+        harness.retrieve(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "intravenous alteplase acute ischemic stroke time window 4.5 hours "
+                        "eligibility criteria contraindications AHA ASA 2019 guideline"
+                    ),
+                }
+            ]
+        )
+    )
+
+    assert result.status == "sufficient"
+    assert [item.cite_uid for item in result.evidence] == ["cite-stroke"]
+    assert [name for name, _arguments in mcp.calls] == [
+        "index_list_documents",
+        "index_get_relevant_nodes",
+        "index_get_page_content",
+    ]
+    list_arguments = mcp.calls[0][1]
+    assert list_arguments["limit"] == 8
+    assert list_arguments["offset"] == 0
+    node_arguments = mcp.calls[1][1]
+    assert node_arguments["node_id"] == "stroke-guide"
+    assert node_arguments["k"] == 8
+    assert mcp.calls[2][1] == {
+        "corpus_tag": "guideline",
+        "doc_id": "stroke-guide",
+        "start_page": 19,
+        "end_page": 20,
+    }
+    finalize_request = create.await_args_list[1].kwargs
+    assert "cite-stroke" in finalize_request["messages"][-1]["content"]
 
 
 def test_text_finalize_call_selects_only_resolvable_citations() -> None:

@@ -463,6 +463,11 @@ def _search_tokens(text: str) -> set[str]:
 
 def _prepare_primary_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Constrain index searches and bias them toward answer-bearing recommendation nodes."""
+    if name == "index_list_documents":
+        prepared = dict(arguments)
+        prepared["limit"] = 8
+        prepared["offset"] = 0
+        return prepared
     if name != "index_get_relevant_nodes":
         return arguments
     prepared = dict(arguments)
@@ -475,6 +480,72 @@ def _prepare_primary_arguments(name: str, arguments: dict[str, Any]) -> dict[str
     prepared["query"] = f"{query} {suffix}".strip()
     prepared["k"] = 8
     return prepared
+
+
+def _index_relevant_nodes_arguments(
+    query: str, list_arguments: dict[str, Any], output: str
+) -> dict[str, Any] | None:
+    """Select one document root and build the relevant-node follow-up."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    documents = payload.get("results") if isinstance(payload, dict) else payload
+    if not isinstance(documents, list):
+        return None
+
+    query_tokens = _search_tokens(query)
+    prefers_current = bool(
+        re.search(r"\b(?:current|latest|updated|recent)\b|최신|현행", query, re.IGNORECASE)
+    )
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    for position, document in enumerate(documents):
+        if not isinstance(document, dict):
+            continue
+        node_id = document.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            continue
+        searchable = " ".join(
+            str(document.get(field, "")) for field in ("title", "summary")
+        )
+        overlap = len(query_tokens & _search_tokens(searchable)) / max(
+            1, len(query_tokens)
+        )
+        semantic_score = document.get("score", 0)
+        if not isinstance(semantic_score, int | float):
+            semantic_score = 0
+        document_years = {
+            int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", searchable)
+        }
+        recency_score = (
+            max(0, min(0.5, (max(document_years) - 2015) * 0.05))
+            if prefers_current and document_years
+            else 0
+        )
+        scope_penalty = 0.75 if NEGATIVE_SCOPE_PATTERN.search(searchable) else 0
+        ranked.append(
+            (
+                2 * overlap
+                + float(semantic_score)
+                + recency_score
+                - scope_penalty,
+                -position,
+                document,
+            )
+        )
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    selected = ranked[0][2]
+    return _prepare_primary_arguments(
+        "index_get_relevant_nodes",
+        {
+            "corpus_tag": list_arguments.get("corpus_tag", "guideline"),
+            "query": query,
+            "node_id": selected["node_id"],
+        },
+    )
 
 
 def _deterministic_guideline_request(
@@ -818,9 +889,34 @@ def _index_page_arguments(
     start_page, end_page = selected["range"]
     if start_page < 1 or end_page < start_page:
         return None
+
+    # A question can require adjacent sections (for example, a treatment window and
+    # its contraindications). Include nearby, relevant nodes from the same document
+    # while keeping the page request within the MCP's bounded four-page window.
+    selected_doc_id = selected["doc_id"]
+    for _score, _position, candidate in ranked[1:]:
+        if candidate.get("doc_id") != selected_doc_id:
+            continue
+        candidate_range = candidate.get("range")
+        if (
+            not isinstance(candidate_range, list)
+            or len(candidate_range) != 2
+            or not all(isinstance(page, int) for page in candidate_range)
+        ):
+            continue
+        candidate_start, candidate_end = candidate_range
+        if candidate_start < 1 or candidate_end < candidate_start:
+            continue
+        if candidate_start > end_page + 1 or candidate_end < start_page - 1:
+            continue
+        combined_start = min(start_page, candidate_start)
+        combined_end = max(end_page, candidate_end)
+        if combined_end - combined_start + 1 <= 4:
+            start_page, end_page = combined_start, combined_end
+
     return {
         "corpus_tag": primary_arguments.get("corpus_tag", "guideline"),
-        "doc_id": selected["doc_id"],
+        "doc_id": selected_doc_id,
         "start_page": start_page,
         "end_page": min(end_page, start_page + 3),
     }
@@ -880,7 +976,7 @@ class L2Harness:
                 ),
             },
         ]
-        documents: list[str] = []
+        citable_documents: list[str] = []
         tool_calls = 0
         selection: CitationSelection | None = None
 
@@ -911,7 +1007,17 @@ class L2Harness:
                     call_number=tool_calls,
                 )
                 output = await self._safe_mcp_call(mcp, call.name, call.arguments)
-                compacted = output[: self.settings.max_tool_result_chars]
+                discovery_limit = min(self.settings.max_tool_result_chars, 3_000)
+                if call.name in {
+                    "index_list_documents",
+                    "index_get_document_structure",
+                    "index_get_relevant_nodes",
+                }:
+                    compacted = output[:discovery_limit]
+                else:
+                    compacted = _truncate_middle(
+                        output, self.settings.max_tool_result_chars
+                    )
                 retrieval_messages.append(
                     {
                         "role": "tool",
@@ -919,8 +1025,18 @@ class L2Harness:
                         "content": compacted or "MCP tool returned no usable content.",
                     }
                 )
-                if compacted:
-                    documents.append(compacted)
+                if len(output) > len(compacted):
+                    _log(
+                        "mcp_result_compacted",
+                        tool=call.name,
+                        original_chars=len(output),
+                        forwarded_chars=len(compacted),
+                        cite_uids_preserved=len(CITE_PATTERN.findall(compacted)),
+                    )
+                if CITE_PATTERN.search(output):
+                    citable_documents.append(
+                        _truncate_middle(output, self.settings.max_evidence_chars)
+                    )
                 return output
 
             def accept_finalize(call: _RequestedToolCall) -> CitationSelection | None:
@@ -980,6 +1096,11 @@ class L2Harness:
                         primary_arguments = _prepare_primary_arguments(
                             chosen.name, chosen.arguments
                         )
+                        if (
+                            chosen.name == "index_list_documents"
+                            and not primary_arguments.get("query")
+                        ):
+                            primary_arguments["query"] = _truncate_middle(context, 6_000)
                         primary_output = await run_mcp_action(
                             _RequestedToolCall(
                                 call_id=chosen.call_id,
@@ -990,13 +1111,56 @@ class L2Harness:
                     else:
                         _log("retrieval_tool_rejected", tool=chosen.name)
 
-            if primary_output and primary_name == "index_get_relevant_nodes":
+            if primary_output and primary_name == "index_list_documents":
+                relevant_arguments = _index_relevant_nodes_arguments(
+                    search_text,
+                    primary_arguments,
+                    primary_output,
+                )
+                if (
+                    relevant_arguments
+                    and "index_get_relevant_nodes" in available_names
+                    and tool_calls < self.settings.max_retrieval_calls
+                ):
+                    _log(
+                        "retrieval_document_selected",
+                        node_id=relevant_arguments.get("node_id"),
+                    )
+                    relevant_output = await run_mcp_action(
+                        _RequestedToolCall(
+                            call_id="retrieval-index-nodes-2",
+                            name="index_get_relevant_nodes",
+                            arguments=relevant_arguments,
+                        )
+                    )
+                    page_arguments = _index_page_arguments(
+                        search_text,
+                        relevant_arguments,
+                        relevant_output,
+                    )
+                    if (
+                        page_arguments
+                        and "index_get_page_content" in available_names
+                        and tool_calls < self.settings.max_retrieval_calls
+                    ):
+                        await run_mcp_action(
+                            _RequestedToolCall(
+                                call_id="retrieval-index-page-3",
+                                name="index_get_page_content",
+                                arguments=page_arguments,
+                            )
+                        )
+            elif primary_output and primary_name == "index_get_relevant_nodes":
                 followup_arguments = _index_page_arguments(
                     f"{search_text}\n{primary_arguments.get('query', '')}",
                     primary_arguments,
                     primary_output,
                 )
-                if followup_arguments and self.settings.max_retrieval_calls >= 2:
+                if (
+                    followup_arguments
+                    and "index_get_page_content" in available_names
+                    and tool_calls < self.settings.max_retrieval_calls
+                ):
                     await run_mcp_action(
                         _RequestedToolCall(
                             call_id="retrieval-index-page-2",
@@ -1025,24 +1189,32 @@ class L2Harness:
                 available_cite_uids = list(
                     dict.fromkeys(
                         cite_uid
-                        for document in documents
+                        for document in citable_documents
                         for cite_uid in CITE_PATTERN.findall(document)
                     )
                 )
-                retrieval_messages.append(
+                citable_context = _truncate_middle(
+                    "\n\n".join(citable_documents),
+                    self.settings.max_evidence_chars,
+                )
+                finalize_messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": RETRIEVAL_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
-                            "End retrieval now. Call finalize_retrieval alone. Select only "
-                            "cite_uid values present in the collected tool results. Available "
-                            "citation identifiers: "
+                            "The MCP call budget is exhausted. End retrieval now by calling "
+                            "finalize_retrieval alone.\n\nSelf-contained query:\n"
+                            + context
+                            + "\n\nAvailable citation identifiers: "
                             + (", ".join(available_cite_uids) or "none")
+                            + "\n\nCollected citable MCP content:\n"
+                            + (citable_context or "No citable content was collected.")
                         ),
-                    }
-                )
+                    },
+                ]
                 finalize_response = await self.client.chat.completions.create(
                     model=self.settings.model,
-                    messages=retrieval_messages,
+                    messages=finalize_messages,
                     tools=[FINALIZE_RETRIEVAL_TOOL],
                     tool_choice="required",
                     temperature=0,
@@ -1075,7 +1247,7 @@ class L2Harness:
             )
         elif selection is not None:
             evidence, missing_cite_uids = _selected_evidence(
-                documents, selection, self.settings.retrieval_top_k
+                citable_documents, selection, self.settings.retrieval_top_k
             )
             note = selection.note
             if missing_cite_uids:
@@ -1097,7 +1269,9 @@ class L2Harness:
                 tool_calls=tool_calls,
             )
         else:
-            evidence = rank_documents(context, documents, self.settings.retrieval_top_k)
+            evidence = rank_documents(
+                context, citable_documents, self.settings.retrieval_top_k
+            )
             _log(
                 "retrieval_finalize_missing",
                 fallback_evidence_count=len(evidence),
