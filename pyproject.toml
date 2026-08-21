@@ -1,0 +1,14 @@
+[project]
+name = "lunit-hackathon"
+version = "0.1.0"
+description = "Basic Lunit Hackathon HealthBench harness"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+lunit-answer = "lunit_hackathon.run_once:main"
+lunit-simulator = "lunit_hackathon.run_simulator:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
