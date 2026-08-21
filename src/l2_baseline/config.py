@@ -6,7 +6,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     api_url: str = Field("https://model.hackathon.lunit.io", alias="LUNIT_FM_API_URL")
-    api_key: SecretStr = Field(alias="LUNIT_FM_API_KEY")
+    # Submission fallback: the evaluator does not mount the local .env file.
+    # An injected LUNIT_FM_API_KEY still takes precedence over this value.
+    api_key: SecretStr = Field(
+        default=SecretStr("lunit_E2V91QFRZ1pr54qdcWmmuHigpP68ZRHA9fgIts31ocY"),
+        alias="LUNIT_FM_API_KEY",
+    )
     model: str = Field("Lunit/L2-preview", alias="LUNIT_FM_MODEL")
     mcp_url: str = Field("https://mcp.hackathon.lunit.io/mcp", alias="LUNIT_MCP_URL")
     patient_api_url: str = Field(
