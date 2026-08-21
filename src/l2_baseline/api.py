@@ -22,7 +22,10 @@ from .models import (
 
 SERVED_MODEL = "Lunit/L2-preview"
 MODE = "bounded-source-retrieval"
-MODEL_CONCURRENCY = 8
+# A timed-out HTTP request can keep generating upstream after the local client has
+# disconnected. Keep the number of accepted L2 jobs below the service-wide limit
+# instead of amplifying congestion with many simultaneous generations.
+MODEL_CONCURRENCY = 2
 _model_slot = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 

@@ -29,7 +29,7 @@ def test_health_identifies_bounded_retrieval_mode() -> None:
     response = TestClient(api.app).get("/health")
     assert response.status_code == 200
     assert response.json()["mode"] == "bounded-source-retrieval"
-    assert response.json()["model_concurrency"] == 8
+    assert response.json()["model_concurrency"] == 2
 
 
 def test_chat_completions_preserves_full_history(monkeypatch: object) -> None:

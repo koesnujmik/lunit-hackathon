@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from openai import APIStatusError, AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from .config import Settings
 from .mcp_client import LunitMCPClient
@@ -15,6 +15,7 @@ from .models import CitationSelection, Evidence, RetrievalResult
 from .prompts import (
     FINAL_GENERATION_SYSTEM_PROMPT,
     GENERATION_SYSTEM_PROMPT,
+    MEMORY_GENERATION_SYSTEM_PROMPT,
     RETRIEVAL_SYSTEM_PROMPT,
 )
 from .ranking import CITE_PATTERN, rank_documents
@@ -174,6 +175,58 @@ IMMEDIATE_EMERGENCY_PATTERN = re.compile(
     r"호흡(?:이)?\s*(?:없|멈)",
     re.IGNORECASE,
 )
+TERMINAL_QUESTION_PATTERN = re.compile(
+    r"[?？](?:\s|[*_`\"'”’)}\]])*$",
+)
+FOLLOW_UP_DETAIL_PATTERNS = {
+    "pediatric_medication": re.compile(
+        r"\b(?:age|weight|ingredient|strength|breathing|sleepiness)\b|"
+        r"나이|체중|성분|함량|호흡|처짐",
+        re.IGNORECASE,
+    ),
+    "requested_questions": re.compile(
+        r"\b(?:when|where|worse|swelling|warmth|fever)\b|"
+        r"언제|부위|악화|붓기|열감|발열",
+        re.IGNORECASE,
+    ),
+    "diagnostic_uncertainty": re.compile(
+        r"\b(?:when|pain|swelling|injury|trauma|locking|giving way)\b|"
+        r"언제|통증|붓기|외상|잠김|힘이\s*빠",
+        re.IGNORECASE,
+    ),
+}
+CLAIM_FRAMING_PATTERN = re.compile(
+    r"\b(?:i heard|is (?:it|that|this) true|claim(?:ed)?|myth|really|"
+    r"can|could|does|do)\b|"
+    r"들었|사실(?:이야|인가|인가요)|정말|속설|주장",
+    re.IGNORECASE,
+)
+CLAIM_EFFECT_PATTERN = re.compile(
+    r"\b(?:cure|treat|heal|reverse|regrow|bring back hair|prevent|detox|"
+    r"cause|improve|work for|effective for)\b|"
+    r"치료|낫게|완치|되돌|머리카락|모발|예방|해독|원인|효과",
+    re.IGNORECASE,
+)
+SAFETY_PERMISSION_PATTERN = re.compile(
+    r"\b(?:can|should|may) i (?:give|take|use)|is it safe (?:to|if)|"
+    r"safe (?:for|during)\b|"
+    r"(?:먹|복용|투여|사용|줘|주어)도\s*(?:돼|되|괜찮)|안전(?:한가|할까|해)",
+    re.IGNORECASE,
+)
+EVIDENCE_CALIBRATION_PATTERN = re.compile(
+    r"\b(?:evidence|research|stud(?:y|ies)|data|support(?:s|ed)?|"
+    r"shown?|demonstrat(?:e|es|ed)|proven|established)\b|"
+    r"근거|연구|자료|뒷받침|입증|확인",
+    re.IGNORECASE,
+)
+NEGATIVE_ANSWER_PATTERN = re.compile(
+    r"^\s*(?:[*_`]+)?(?:no|아니요|아니오)\b",
+    re.IGNORECASE,
+)
+BARE_NEGATIVE_ANSWER_PATTERN = re.compile(
+    r"^\s*(?:[*_`]+)?(?:no|아니요|아니오)(?:[*_`]+)?[.!。！]?\s*$",
+    re.IGNORECASE,
+)
 
 RETRIEVE_RELEVANT_CONTENT_TOOL = {
     "type": "function",
@@ -287,9 +340,77 @@ def _follow_up_requirement(messages: list[dict[str, str]]) -> str | None:
     return None
 
 
+def _requires_claim_calibration(messages: list[dict[str, str]]) -> bool:
+    """Detect efficacy or causation claims without weakening direct safety prohibitions."""
+    context = _conversation_context(messages)
+    if SAFETY_PERMISSION_PATTERN.search(context):
+        return False
+    return bool(
+        CLAIM_FRAMING_PATTERN.search(context) and CLAIM_EFFECT_PATTERN.search(context)
+    )
+
+
+def _ensure_claim_calibration(answer: str, required: bool, latest: str) -> str:
+    """Qualify unsupported health claims without adding another model call."""
+    if not required:
+        return answer
+    if EVIDENCE_CALIBRATION_PATTERN.search(answer):
+        _log("claim_calibration_audit_completed", passed=True, issues=[])
+        return answer
+
+    korean = any("가" <= character <= "힣" for character in latest)
+    negative = bool(NEGATIVE_ANSWER_PATTERN.search(answer))
+    if negative:
+        calibration = (
+            "아니요. 현재 신뢰할 만한 의학적 근거는 그 주장을 뒷받침하지 않습니다."
+            if korean
+            else "No—current reliable medical evidence does not support that claim."
+        )
+    else:
+        calibration = (
+            "이 결론의 확실성은 현재 신뢰할 만한 의학적 근거의 강도에 맞춰 "
+            "해석해야 합니다."
+            if korean
+            else "The certainty of this conclusion should match the strength of current "
+            "reliable medical evidence."
+        )
+    _log(
+        "claim_calibration_audit_completed",
+        passed=False,
+        issues=["missing_evidence_calibration"],
+    )
+    if negative and BARE_NEGATIVE_ANSWER_PATTERN.fullmatch(answer):
+        repaired = calibration
+    else:
+        repaired = answer.rstrip() + "\n\n" + calibration
+    _log("claim_calibration_repaired", negative_answer=negative)
+    return repaired
+
+
+def _follow_up_audit(answer: str, requirement: str | None) -> list[str]:
+    """Check that a required follow-up is specific and placed at the end."""
+    if requirement is None:
+        return []
+    stripped = answer.strip()
+    final_paragraph = re.split(r"\n\s*\n", stripped)[-1] if stripped else ""
+    issues: list[str] = []
+    if not TERMINAL_QUESTION_PATTERN.search(final_paragraph):
+        issues.append("missing_terminal_question")
+    question_count = len(re.findall(r"[?？]", final_paragraph))
+    if question_count < 1 or question_count > 2:
+        issues.append("terminal_question_count")
+    detail_pattern = FOLLOW_UP_DETAIL_PATTERNS.get(requirement)
+    if detail_pattern is not None and not detail_pattern.search(final_paragraph):
+        issues.append("non_specific_terminal_question")
+    return issues
+
+
 def _ensure_required_follow_up(answer: str, requirement: str | None, latest: str) -> str:
     """Add one bounded, high-yield question without another model call."""
-    if requirement is None or re.search(r"[?？]", answer):
+    issues = _follow_up_audit(answer, requirement)
+    if not issues:
+        if requirement is not None:
+            _log("follow_up_audit_completed", passed=True, issues=[])
         return answer
     korean = any("가" <= character <= "힣" for character in latest)
     if requirement == "pediatric_medication":
@@ -317,8 +438,16 @@ def _ensure_required_follow_up(answer: str, requirement: str | None, latest: str
             else "To narrow this down, when did it start, and is there pain, swelling, an "
             "injury, locking, or giving way?"
         )
-    _log("follow_up_question_appended", reason=requirement)
-    return answer.rstrip() + "\n\n" + question
+    _log("follow_up_audit_completed", passed=False, issues=issues)
+    repaired = answer.rstrip() + "\n\n" + question
+    remaining_issues = _follow_up_audit(repaired, requirement)
+    _log(
+        "follow_up_question_appended",
+        reason=requirement,
+        passed=not remaining_issues,
+        issues=remaining_issues,
+    )
+    return repaired
 
 
 def _log(event: str, **fields: object) -> None:
@@ -469,6 +598,27 @@ def _answer_only_retry_messages(
     return answer_messages
 
 
+def _single_turn_recovery_messages(
+    messages: list[dict[str, Any]], *, max_chars: int
+) -> list[dict[str, str]]:
+    """Flatten multi-turn history for L2's single-turn-optimized recovery path."""
+    conversation = "\n\n".join(
+        f"{str(message.get('role', 'user')).upper()}: {message.get('content', '')}"
+        for message in messages
+        if isinstance(message.get("content"), str) and message.get("content", "").strip()
+    )
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Use the conversation below as context. Answer the final USER message only. "
+                "Preserve the user's language, clinical details, and requested format.\n\n"
+                + _truncate_middle(conversation, max_chars)
+            ),
+        }
+    ]
+
+
 def _response_language_instruction(text: str) -> str:
     if any("가" <= character <= "힣" for character in text):
         return "The required response language is Korean."
@@ -494,6 +644,28 @@ def _truncate_middle(text: str, limit: int) -> str:
     head = remaining // 2
     tail = remaining - head
     return text[:head] + marker + text[-tail:]
+
+
+def _complete_sentence_prefix(text: str) -> str:
+    """Prefer a complete usable prefix when a retry cannot replace a truncated draft."""
+    matches = list(re.finditer(r"[.!?。！？](?:[\"'”’)}\]])?", text))
+    if not matches:
+        return text.strip()
+    completed = text[: matches[-1].end()].strip()
+    return completed if len(completed) >= 20 else text.strip()
+
+
+def _drop_incomplete_final_bullet(text: str) -> str:
+    """Remove a visibly cut-off last bullet from a nominally stopped L2 stream."""
+    lines = text.rstrip().splitlines()
+    if not lines:
+        return text.strip()
+    final_line = lines[-1].strip()
+    if final_line.startswith(("- ", "* ")) and not re.search(
+        r"[.!?。！？:;)](?:[*_`\"'”’)}\]])?$", final_line
+    ):
+        return "\n".join(lines[:-1]).rstrip()
+    return text.strip()
 
 
 def _compact_messages(
@@ -1618,9 +1790,15 @@ class L2Harness:
     ) -> tuple[str | None, _GenerationRetrievalRequest | None]:
         """Let L2 answer from memory or request the generation stage's only tool."""
         last_finish_reason: str | None = None
+        transport_failures = 0
         for attempt in range(3):
             attempt_prompt = system_prompt
-            attempt_max_tokens = self.settings.generation_max_tokens
+            attempt_max_tokens = min(
+                self.settings.generation_max_tokens,
+                1_024 if allow_retrieval else 512,
+            )
+            attempt_messages = messages
+            attempt_timeout_sec = self.settings.decision_primary_timeout_sec
             if attempt:
                 if allow_retrieval:
                     attempt_prompt += (
@@ -1636,25 +1814,71 @@ class L2Harness:
                         "from medical knowledge. Do not request retrieval or return hidden "
                         "reasoning."
                     )
-                attempt_max_tokens = (
-                    2_048
-                    if last_finish_reason == "length"
-                    else min(attempt_max_tokens, 512)
+                if attempt == 2:
+                    attempt_prompt += (
+                        " Give the direct answer first and keep the complete response under "
+                        "120 words."
+                    )
+                attempt_max_tokens = min(
+                    attempt_max_tokens,
+                    384 if attempt == 2 else 512,
                 )
+                attempt_messages = _single_turn_recovery_messages(
+                    messages,
+                    max_chars=3_000 if attempt == 2 else 6_000,
+                )
+                attempt_timeout_sec = self.settings.decision_retry_timeout_sec
             try:
                 request: dict[str, Any] = {
                     "model": self.settings.model,
-                    "messages": [{"role": "system", "content": attempt_prompt}, *messages],
+                    "messages": [
+                        {"role": "system", "content": attempt_prompt},
+                        *attempt_messages,
+                    ],
                     "temperature": 0,
                     "max_tokens": attempt_max_tokens,
+                    "timeout": attempt_timeout_sec,
                 }
                 if allow_retrieval:
                     request.update(
                         tools=[RETRIEVE_RELEVANT_CONTENT_TOOL],
                         tool_choice="auto",
                     )
+                else:
+                    # L2 can take longer than the HTTP read timeout to finish a
+                    # medical answer. Its streaming endpoint emits progress while
+                    # generating, so collect that stream internally and still
+                    # return one ordinary OpenAI-compatible response to our caller.
+                    request["stream"] = True
                 response = await self.client.chat.completions.create(**request)
+            except APITimeoutError:
+                # The upstream job may continue after our HTTP client disconnects.
+                # Retrying immediately creates a second expensive generation and can
+                # exhaust the L2 service's global concurrency allowance.
+                raise
+            except APIConnectionError as exc:
+                transport_failures += 1
+                if transport_failures == 1 and attempt < 2:
+                    _log(
+                        "generation_upstream_retry",
+                        phase="decision",
+                        attempt=attempt + 1,
+                        error_type=type(exc).__name__,
+                        next_timeout_sec=self.settings.decision_retry_timeout_sec,
+                    )
+                    continue
+                raise
             except APIStatusError as exc:
+                if exc.status_code == 429 and attempt < 2:
+                    delay_sec = 2.0 * (attempt + 1)
+                    _log(
+                        "generation_rate_limited",
+                        phase="decision",
+                        attempt=attempt + 1,
+                        retry_delay_sec=delay_sec,
+                    )
+                    await asyncio.sleep(delay_sec)
+                    continue
                 if exc.status_code >= 500 and attempt < 2:
                     _log(
                         "generation_upstream_retry",
@@ -1665,31 +1889,61 @@ class L2Harness:
                     continue
                 raise
 
-            choice = response.choices[0]
-            message = choice.message
-            retrieval_request = (
-                _generation_retrieval_request(message, attempt + 1)
-                if allow_retrieval
-                else None
-            )
-            if retrieval_request is not None:
-                return None, retrieval_request
-
-            content = message.content or ""
+            if hasattr(response, "choices"):
+                # Keep accepting ordinary responses for compatible upstreams and
+                # the unit-test client. The Lunit memory path normally uses the
+                # streaming branch below.
+                choice = response.choices[0]
+                message = choice.message
+                retrieval_request = (
+                    _generation_retrieval_request(message, attempt + 1)
+                    if allow_retrieval
+                    else None
+                )
+                if retrieval_request is not None:
+                    return None, retrieval_request
+                content = message.content or ""
+                finish_reason = getattr(choice, "finish_reason", None)
+                tool_names = [
+                    getattr(getattr(call, "function", None), "name", "")
+                    for call in (getattr(message, "tool_calls", None) or [])
+                ]
+                refusal_present = bool(getattr(message, "refusal", None))
+            else:
+                stream_started = time.monotonic()
+                content_parts: list[str] = []
+                finish_reason = None
+                async for chunk in response:
+                    if not chunk.choices:
+                        continue
+                    stream_choice = chunk.choices[0]
+                    delta_content = getattr(stream_choice.delta, "content", None)
+                    if delta_content:
+                        content_parts.append(delta_content)
+                    if stream_choice.finish_reason is not None:
+                        finish_reason = stream_choice.finish_reason
+                content = "".join(content_parts)
+                content = _drop_incomplete_final_bullet(content)
+                tool_names = []
+                refusal_present = False
+                _log(
+                    "generation_upstream_stream_completed",
+                    phase="decision",
+                    elapsed_ms=round((time.monotonic() - stream_started) * 1_000),
+                    answer_chars=len(content),
+                    finish_reason=finish_reason,
+                )
             if content.strip() and not TEXT_TOOL_CALL_PATTERN.search(content):
                 return content, None
 
-            last_finish_reason = getattr(choice, "finish_reason", None)
+            last_finish_reason = finish_reason
             _log(
                 "empty_generation",
                 phase="decision",
                 attempt=attempt + 1,
                 finish_reason=last_finish_reason,
-                tool_names=[
-                    getattr(getattr(call, "function", None), "name", "")
-                    for call in (getattr(message, "tool_calls", None) or [])
-                ],
-                refusal_present=bool(getattr(message, "refusal", None)),
+                tool_names=tool_names,
+                refusal_present=refusal_present,
             )
         raise RuntimeError(
             "L2 returned neither an answer nor a valid retrieval request within the retry budget"
@@ -1701,13 +1955,31 @@ class L2Harness:
         messages: list[dict[str, Any]],
         *,
         max_tokens: int | None = None,
+        deadline: float | None = None,
     ) -> str:
         last_finish_reason: str | None = None
+        best_partial: str | None = None
+        transport_failures = 0
         base_max_tokens = min(
             self.settings.generation_max_tokens,
             max_tokens or self.settings.generation_max_tokens,
         )
         for attempt in range(3):
+            remaining_sec = (
+                deadline - time.monotonic()
+                if deadline is not None
+                else self.settings.request_timeout_sec
+            )
+            if remaining_sec < 3:
+                if best_partial:
+                    fallback = _complete_sentence_prefix(best_partial)
+                    _log(
+                        "final_generation_partial_fallback",
+                        reason="insufficient_time",
+                        answer_chars=len(fallback),
+                    )
+                    return fallback
+                raise TimeoutError("Insufficient turn time for final generation")
             attempt_prompt = system_prompt
             attempt_max_tokens = base_max_tokens
             attempt_messages = messages
@@ -1734,6 +2006,16 @@ class L2Harness:
                     else min(base_max_tokens, 512)
                 )
                 attempt_messages = _answer_only_retry_messages(messages)
+            retry_reserve_sec = 10.0 if attempt == 0 and remaining_sec >= 15 else 0.0
+            attempt_timeout_sec = min(
+                self.settings.request_timeout_sec,
+                (
+                    self.settings.decision_retry_timeout_sec
+                    if attempt
+                    else max(3.0, remaining_sec - retry_reserve_sec - 1.0)
+                ),
+                max(1.0, remaining_sec - 1.0),
+            )
             try:
                 response = await self.client.chat.completions.create(
                     model=self.settings.model,
@@ -1743,8 +2025,58 @@ class L2Harness:
                     ],
                     temperature=0,
                     max_tokens=attempt_max_tokens,
+                    timeout=attempt_timeout_sec,
                 )
+            except APITimeoutError as exc:
+                if best_partial:
+                    fallback = _complete_sentence_prefix(best_partial)
+                    _log(
+                        "final_generation_partial_fallback",
+                        reason=type(exc).__name__,
+                        answer_chars=len(fallback),
+                    )
+                    return fallback
+                # Do not duplicate a generation that may still be running upstream.
+                raise
+            except APIConnectionError as exc:
+                transport_failures += 1
+                if best_partial:
+                    fallback = _complete_sentence_prefix(best_partial)
+                    _log(
+                        "final_generation_partial_fallback",
+                        reason=type(exc).__name__,
+                        answer_chars=len(fallback),
+                    )
+                    return fallback
+                if transport_failures == 1 and attempt < 2:
+                    _log(
+                        "generation_upstream_retry",
+                        phase="final",
+                        attempt=attempt + 1,
+                        error_type=type(exc).__name__,
+                        next_timeout_sec=self.settings.decision_retry_timeout_sec,
+                    )
+                    continue
+                raise
             except APIStatusError as exc:
+                if exc.status_code >= 500 and best_partial:
+                    fallback = _complete_sentence_prefix(best_partial)
+                    _log(
+                        "final_generation_partial_fallback",
+                        reason=f"HTTP_{exc.status_code}",
+                        answer_chars=len(fallback),
+                    )
+                    return fallback
+                if exc.status_code == 429 and attempt < 2:
+                    delay_sec = 2.0 * (attempt + 1)
+                    _log(
+                        "generation_rate_limited",
+                        phase="final",
+                        attempt=attempt + 1,
+                        retry_delay_sec=delay_sec,
+                    )
+                    await asyncio.sleep(delay_sec)
+                    continue
                 if exc.status_code >= 500 and attempt < 2:
                     _log(
                         "generation_upstream_retry",
@@ -1761,8 +2093,13 @@ class L2Harness:
             if content.strip() and not native_tool_calls and not text_tool_calls:
                 finish_reason = getattr(choice, "finish_reason", None)
                 if finish_reason != "length" or attempt == 2:
-                    return content
+                    return (
+                        _complete_sentence_prefix(content)
+                        if finish_reason == "length"
+                        else content
+                    )
                 last_finish_reason = finish_reason
+                best_partial = content
                 _log(
                     "final_generation_truncated",
                     attempt=attempt + 1,
@@ -1790,6 +2127,14 @@ class L2Harness:
                 ],
                 refusal_present=bool(getattr(choice.message, "refusal", None)),
             )
+        if best_partial:
+            fallback = _complete_sentence_prefix(best_partial)
+            _log(
+                "final_generation_partial_fallback",
+                reason="retry_budget_exhausted",
+                answer_chars=len(fallback),
+            )
+            return fallback
         raise RuntimeError("L2 returned no usable answer within the bounded retry budget")
 
     async def _repair_citations(
@@ -1862,6 +2207,7 @@ class L2Harness:
             user_routing_context
         )
         follow_up_requirement = _follow_up_requirement(compact_messages)
+        claim_calibration_required = _requires_claim_calibration(compact_messages)
         if follow_up_requirement is not None:
             generation_prompt += (
                 "\n\nThis case requires active context seeking. After giving any immediately "
@@ -1883,11 +2229,19 @@ class L2Harness:
             )
         else:
             if not explicit_retrieval_intent:
+                generation_prompt = (
+                    MEMORY_GENERATION_SYSTEM_PROMPT
+                    + "\n"
+                    + _response_language_instruction(messages[-1]["content"])
+                )
+                if follow_up_requirement is not None:
+                    generation_prompt += (
+                        "\n\nAfter giving any immediately safe and useful answer, end with one "
+                        "explicit, highest-yield question to the user, using a question mark."
+                    )
                 generation_prompt += (
-                    "\n\nThe conversation does not explicitly request a guideline, official "
-                    "source, current evidence, citation, law, reimbursement rule, approval, "
-                    "label, or code. Answer directly from stable medical knowledge. No retrieval "
-                    "tool is available for this turn."
+                    "\n\nNo retrieval tool is available for this turn. Return the medical "
+                    "answer directly."
                 )
                 _log("generation_memory_only", strategy="no_explicit_evidence_request")
             memory_answer, retrieval_request = await self._start_generation(
@@ -1897,6 +2251,11 @@ class L2Harness:
             )
         if memory_answer is not None:
             _log("generation_memory_answer")
+            memory_answer = _ensure_claim_calibration(
+                memory_answer,
+                claim_calibration_required,
+                messages[-1]["content"],
+            )
             return _ensure_required_follow_up(
                 memory_answer,
                 follow_up_requirement,
@@ -1985,11 +2344,7 @@ class L2Harness:
             grounded_prompt,
             generation_messages,
             max_tokens=final_max_tokens,
-        )
-        answer = _ensure_required_follow_up(
-            answer,
-            follow_up_requirement,
-            messages[-1]["content"],
+            deadline=turn_started + self.settings.turn_timeout_sec - 1,
         )
         _log(
             "final_generation_completed",
@@ -2063,4 +2418,13 @@ class L2Harness:
                     )
                     if adopted:
                         answer = repaired
-        return answer
+        answer = _ensure_claim_calibration(
+            answer,
+            claim_calibration_required,
+            messages[-1]["content"],
+        )
+        return _ensure_required_follow_up(
+            answer,
+            follow_up_requirement,
+            messages[-1]["content"],
+        )

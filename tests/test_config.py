@@ -37,8 +37,10 @@ def test_timeout_defaults_bound_one_turn(monkeypatch: MonkeyPatch) -> None:
 
     settings = Settings(_env_file=None)
 
-    assert settings.request_timeout_sec == 45
-    assert settings.turn_timeout_sec == 55
+    assert settings.request_timeout_sec == 75
+    assert settings.decision_primary_timeout_sec == 70
+    assert settings.decision_retry_timeout_sec == 18
+    assert settings.turn_timeout_sec == 90
     assert settings.retrieval_timeout_sec == 25
     assert settings.max_retrieval_calls == 4
     assert settings.generation_max_tokens == 2_048

@@ -4,8 +4,9 @@ from types import SimpleNamespace
 from typing import Any, Self
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 from httpx import Request, Response
-from openai import InternalServerError
+from openai import APITimeoutError, InternalServerError
 
 from l2_baseline.config import Settings
 from l2_baseline.harness import (
@@ -14,7 +15,10 @@ from l2_baseline.harness import (
     _compact_messages,
     _deterministic_guideline_request,
     _deterministic_structured_request,
+    _drop_incomplete_final_bullet,
+    _ensure_claim_calibration,
     _ensure_required_follow_up,
+    _follow_up_audit,
     _follow_up_requirement,
     _guideline_focus_queries,
     _has_explicit_retrieval_intent,
@@ -22,6 +26,7 @@ from l2_baseline.harness import (
     _index_page_arguments,
     _index_relevant_nodes_arguments,
     _prepare_primary_arguments,
+    _requires_claim_calibration,
     _response_language_instruction,
 )
 from l2_baseline.models import Evidence, RetrievalResult
@@ -50,6 +55,28 @@ def _response(
     return SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
     )
+
+
+class _AsyncChunkStream:
+    def __init__(self, *chunks: tuple[str, str | None]) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> "_AsyncChunkStream":
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            content, finish_reason = next(self._chunks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=content),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
 
 
 def _call(name: str, arguments: str, call_id: str = "call-1") -> Mock:
@@ -619,6 +646,37 @@ def test_existing_explicit_follow_up_is_not_duplicated() -> None:
     assert result == answer
 
 
+def test_question_in_the_middle_does_not_satisfy_terminal_follow_up() -> None:
+    answer = (
+        "Could this be mechanical? That is the most likely explanation. "
+        "Monitor it for now."
+    )
+
+    result = _ensure_required_follow_up(
+        answer,
+        "diagnostic_uncertainty",
+        "Give me one definite cause for my knee clicking.",
+    )
+
+    assert result.startswith(answer)
+    assert result.endswith("giving way?")
+    assert _follow_up_audit(result, "diagnostic_uncertainty") == []
+
+
+def test_generic_terminal_question_is_supplemented_by_specific_follow_up() -> None:
+    answer = "This is probably mechanical. Would you like more information?"
+
+    result = _ensure_required_follow_up(
+        answer,
+        "diagnostic_uncertainty",
+        "Give me one definite cause for my knee clicking.",
+    )
+
+    assert result.startswith(answer)
+    assert result.endswith("giving way?")
+    assert _follow_up_audit(result, "diagnostic_uncertainty") == []
+
+
 def test_child_medication_with_missing_weight_requires_safety_question() -> None:
     messages = [
         {"role": "user", "content": "Can I give my child medicine for a fever?"},
@@ -658,6 +716,52 @@ def test_immediate_emergency_does_not_delay_action_with_forced_question() -> Non
     ]
 
     assert _follow_up_requirement(messages) is None
+
+
+def test_bare_no_to_medical_myth_is_calibrated_to_the_evidence() -> None:
+    harness, create, mcp = _harness([_response(content="No.")])
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "I heard that drinking three cups of coffee a day can bring back hair "
+                "for men with male pattern baldness."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "You are asking whether coffee can regrow hair.",
+        },
+        {"role": "user", "content": "I want a yes or no answer. In English."},
+    ]
+
+    answer = asyncio.run(harness.chat(messages))
+
+    assert answer == "No—current reliable medical evidence does not support that claim."
+    assert "distinguish \"not supported by" in create.await_args.kwargs["messages"][0][
+        "content"
+    ]
+    assert mcp.calls == []
+
+
+def test_already_calibrated_claim_answer_is_not_changed() -> None:
+    answer = "No. Current evidence does not support that claim."
+
+    assert (
+        _ensure_claim_calibration(answer, required=True, latest="Answer in English.")
+        == answer
+    )
+
+
+def test_direct_safety_prohibition_is_not_treated_as_a_medical_myth() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": "Can I give my child leftover codeine cough syrup?",
+        }
+    ]
+
+    assert _requires_claim_calibration(messages) is False
 
 
 def test_general_question_rejects_spurious_retrieval_request() -> None:
@@ -707,9 +811,34 @@ def test_empty_direct_answer_is_retried_once_locally() -> None:
     retry_request = create.await_args_list[1].kwargs
     assert "RECOVERY INSTRUCTION" in retry_request["messages"][0]["content"]
     assert retry_request["max_tokens"] == 512
+    assert retry_request["timeout"] == 18
+    assert len(retry_request["messages"]) == 2
+    assert "Answer the final USER message only" in retry_request["messages"][1][
+        "content"
+    ]
 
 
-def test_length_only_response_gets_larger_recovery_budget() -> None:
+def test_memory_answer_is_collected_from_upstream_stream() -> None:
+    harness, create, _mcp = _harness(
+        [_AsyncChunkStream(("A safe ", None), ("answer.", "stop"))]
+    )
+
+    answer = asyncio.run(harness.chat([{"role": "user", "content": "general question"}]))
+
+    assert answer == "A safe answer."
+    assert create.await_args.kwargs["stream"] is True
+    assert create.await_args.kwargs["max_tokens"] == 512
+    assert "without tools" in create.await_args.kwargs["messages"][0]["content"]
+    assert "tools" not in create.await_args.kwargs
+
+
+def test_incomplete_final_stream_bullet_is_removed() -> None:
+    answer = "Useful answer.\n\n- Complete item\n- Difficulty"
+
+    assert _drop_incomplete_final_bullet(answer) == "Useful answer.\n\n- Complete item"
+
+
+def test_length_only_response_gets_concise_recovery_budget() -> None:
     harness, create, _mcp = _harness(
         [
             _response(content="", finish_reason="length"),
@@ -720,7 +849,35 @@ def test_length_only_response_gets_larger_recovery_budget() -> None:
     answer = asyncio.run(harness.chat([{"role": "user", "content": "complex question"}]))
 
     assert answer == "recovered answer"
-    assert create.await_args_list[1].kwargs["max_tokens"] == 2_048
+    assert create.await_args_list[0].kwargs["timeout"] == 70
+    assert create.await_args_list[1].kwargs["max_tokens"] == 512
+    assert create.await_args_list[1].kwargs["timeout"] == 18
+
+
+def test_upstream_timeout_does_not_duplicate_a_running_generation() -> None:
+    timeout = APITimeoutError(request=Request("POST", "https://model.test"))
+    harness, create, _mcp = _harness([timeout])
+    messages = [
+        {"role": "user", "content": "My lips tingle when I eat peanuts."},
+        {"role": "assistant", "content": "That may be an allergic reaction."},
+        {"role": "user", "content": "What should I do now?"},
+    ]
+
+    with pytest.raises(APITimeoutError):
+        asyncio.run(harness.chat(messages))
+
+    assert create.await_count == 1
+    assert create.await_args_list[0].kwargs["timeout"] == 70
+
+
+def test_single_upstream_timeout_stops_without_transport_retry() -> None:
+    timeout = APITimeoutError(request=Request("POST", "https://model.test"))
+    harness, create, _mcp = _harness([timeout])
+
+    with pytest.raises(APITimeoutError):
+        asyncio.run(harness.chat([{"role": "user", "content": "general question"}]))
+
+    assert create.await_count == 1
 
 
 def test_empty_then_transient_500_can_recover_within_local_budget() -> None:
@@ -1066,6 +1223,45 @@ def test_truncated_final_generation_is_rewritten_concisely() -> None:
     assert "previous draft was cut off" in create.await_args_list[1].kwargs["messages"][
         0
     ]["content"]
+
+
+def test_final_generation_timeout_returns_completed_partial_draft() -> None:
+    harness, create, _mcp = _harness(
+        [
+            _response(
+                content="Supported safety statement [1]. unfinished detail",
+                finish_reason="length",
+            ),
+            APITimeoutError(request=Request("POST", "https://model.test")),
+        ]
+    )
+    harness.retrieve = AsyncMock(
+        return_value=RetrievalResult(
+            status="sufficient",
+            evidence=[
+                Evidence(
+                    cite_uid="cite-1",
+                    relevance_score=0.95,
+                    content="Supported safety statement.",
+                )
+            ],
+        )
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "What does the current safety guideline recommend?",
+                }
+            ]
+        )
+    )
+
+    assert answer == "Supported safety statement [1]."
+    assert create.await_count == 2
+    assert create.await_args_list[1].kwargs["timeout"] <= 18
 
 
 def test_structured_source_route_skips_l2_tool_selection() -> None:

@@ -58,9 +58,15 @@ class Settings(BaseSettings):
         512, alias="L2_RETRIEVAL_MAX_TOKENS", ge=256, le=1_024
     )
     request_timeout_sec: float = Field(
-        45, alias="L2_REQUEST_TIMEOUT_SEC", ge=10, le=50
+        75, alias="L2_REQUEST_TIMEOUT_SEC", ge=10, le=85
     )
-    turn_timeout_sec: float = Field(55, alias="L2_TURN_TIMEOUT_SEC", ge=15, le=60)
+    decision_primary_timeout_sec: float = Field(
+        70, alias="L2_DECISION_PRIMARY_TIMEOUT_SEC", ge=10, le=80
+    )
+    decision_retry_timeout_sec: float = Field(
+        18, alias="L2_DECISION_RETRY_TIMEOUT_SEC", ge=5, le=25
+    )
+    turn_timeout_sec: float = Field(90, alias="L2_TURN_TIMEOUT_SEC", ge=15, le=100)
     generation_max_tokens: int = Field(
         2_048, alias="L2_GENERATION_MAX_TOKENS", ge=256, le=2_048
     )
