@@ -2,6 +2,7 @@ import time
 import uuid
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from .harness import L2Harness
 from .models import (
@@ -18,7 +19,16 @@ from .models import (
 
 SERVED_MODEL = "Lunit/L2-preview"
 
-app = FastAPI(title="Lunit L2 Medical Chatbot Driver", version="1.0.0")
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+
+app = FastAPI(
+    title="Lunit L2 Medical Chatbot Driver",
+    version="1.0.0",
+    default_response_class=UTF8JSONResponse,
+)
 _harness: L2Harness | None = None
 
 

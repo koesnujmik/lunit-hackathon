@@ -2,6 +2,7 @@ import json
 from contextlib import AsyncExitStack
 from typing import Any, Self
 
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -16,8 +17,15 @@ class LunitMCPClient:
 
     async def __aenter__(self) -> Self:
         self._stack = AsyncExitStack()
+        http_client = await self._stack.enter_async_context(
+            httpx.AsyncClient(
+                headers=self.headers,
+                timeout=httpx.Timeout(self.timeout_sec),
+                follow_redirects=True,
+            )
+        )
         read, write, _ = await self._stack.enter_async_context(
-            streamable_http_client(self.url, headers=self.headers)
+            streamable_http_client(self.url, http_client=http_client)
         )
         self._session = await self._stack.enter_async_context(ClientSession(read, write))
         await self._session.initialize()

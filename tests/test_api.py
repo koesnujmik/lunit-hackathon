@@ -15,6 +15,7 @@ class FakeHarness:
 def test_models_endpoint() -> None:
     response = TestClient(api.app).get("/v1/models")
     assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json; charset=utf-8"
     assert response.json()["data"][0]["id"] == "Lunit/L2-preview"
 
 
