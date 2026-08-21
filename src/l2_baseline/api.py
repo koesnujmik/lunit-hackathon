@@ -21,8 +21,8 @@ from .models import (
 )
 
 SERVED_MODEL = "Lunit/L2-preview"
-MODE = "trial-direct-only"
-MODEL_CONCURRENCY = 4
+MODE = "bounded-source-retrieval"
+MODEL_CONCURRENCY = 8
 _model_slot = asyncio.Semaphore(MODEL_CONCURRENCY)
 
 
@@ -74,8 +74,8 @@ async def create_chat_completion(
     )
     try:
         harness = get_harness()
-        async with asyncio.timeout(harness.settings.turn_timeout_sec):
-            async with _model_slot:
+        async with _model_slot:
+            async with asyncio.timeout(harness.settings.turn_timeout_sec):
                 answer = await harness.chat(messages)
     except ValueError as exc:
         _log("request_failed", request_id=request_id, kind="input")
@@ -160,8 +160,8 @@ def _event_stream_payload(completion: ChatCompletionResponse) -> str:
 async def chat(request: ChatRequest) -> ChatResponse:
     try:
         harness = get_harness()
-        async with asyncio.timeout(harness.settings.turn_timeout_sec):
-            async with _model_slot:
+        async with _model_slot:
+            async with asyncio.timeout(harness.settings.turn_timeout_sec):
                 answer = await harness.chat(request.messages)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

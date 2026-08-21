@@ -1,17 +1,23 @@
-# Lunit L2 Direct Trial Driver
+# Lunit L2 Bounded Retrieval Driver
 
 Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation driver입니다.
 최종 답변은 `Lunit/L2-preview`가 생성합니다.
 
 ## 처리 흐름
 
-1. 최근 4개 message만 유지하고 message별 길이를 제한합니다.
-2. MCP retrieval과 tool call 없이 L2를 정확히 한 번 호출합니다.
-3. 전체 turn을 55초로 제한하고 L2 SDK retry를 끕니다.
-4. 일반 JSON과 OpenAI-compatible SSE streaming 응답을 모두 지원합니다.
+1. 첫 user 질문과 최근 5개 message를 유지하고 message별 길이를 제한합니다.
+2. 일반 의료 질문은 L2를 한 번 호출해 직접 답합니다.
+3. guideline, 법령, 급여, 허가, drug label, code, citation처럼 외부 근거가 명확히
+   필요한 질문만 retrieval로 보냅니다.
+4. Guideline은 결정적 2-step index 조회를 사용하고, 그 밖의 근거 질문은 L2 tool
+   selector 1회와 MCP tool 최대 2회로 제한해 18초 안에 끝냅니다.
+5. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
 
-이 버전은 장시간 retrieval로 CoEval 전체가 중단되는 문제를 분리하기 위한 안정성 baseline입니다.
-bounded retrieval은 direct-only trial 완주를 확인한 뒤 tool 1~2회 제한으로 다시 추가합니다.
+동시에 최대 8개 turn을 처리하며, 대기열에서 기다린 시간은 실제 turn의 55초 처리 제한에
+포함하지 않습니다.
+
+반복적인 HyDE/reflection loop는 사용하지 않습니다. Retrieval이 실패하거나 제한 시간을 넘겨도
+최종 L2 generation은 실행해 안전한 일반 답변과 근거 한계를 전달합니다.
 
 ## 로컬 Python 실행
 
@@ -51,7 +57,7 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-Evaluator가 전달한 `messages` 중 최근 4개를 별도의 session ID 없이 사용합니다.
+Evaluator가 전달한 `messages` 중 첫 user 질문과 최근 5개를 별도의 session ID 없이 사용합니다.
 `stream: true`에는 OpenAI-compatible SSE 형식으로 응답합니다.
 
 ## Docker 검증
@@ -69,9 +75,14 @@ Container는 `.env` 없이 image 내부의 `submission_api_key`를 읽고 `0.0.0
 ```text
 L2_REQUEST_TIMEOUT_SEC=45
 L2_TURN_TIMEOUT_SEC=55
-L2_GENERATION_MAX_TOKENS=1536
-L2_MAX_HISTORY_MESSAGES=4
-L2_MAX_MESSAGE_CHARS=6000
+L2_RETRIEVAL_TIMEOUT_SEC=18
+L2_MAX_RETRIEVAL_CALLS=2
+L2_MAX_TOOL_RESULT_CHARS=6000
+L2_MAX_EVIDENCE_CHARS=10000
+L2_RETRIEVAL_MAX_TOKENS=512
+L2_GENERATION_MAX_TOKENS=2048
+L2_MAX_HISTORY_MESSAGES=6
+L2_MAX_MESSAGE_CHARS=4000
 LUNIT_SUBMISSION_API_KEY_FILE=submission_api_key
 ```
 

@@ -42,19 +42,30 @@ class Settings(BaseSettings):
     patient_api_url: str = Field(
         "https://patient.hackathon.lunit.io", alias="LUNIT_PATIENT_API_URL"
     )
-    max_retrieval_calls: int = Field(8, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=30)
-    max_reflection_rounds: int = Field(4, alias="L2_MAX_REFLECTION_ROUNDS", ge=1, le=10)
+    max_retrieval_calls: int = Field(2, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=2)
     retrieval_top_k: int = Field(3, alias="L2_RETRIEVAL_TOP_K", ge=1, le=10)
-    tool_candidate_limit: int = Field(3, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=20)
+    tool_candidate_limit: int = Field(8, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=20)
+    retrieval_timeout_sec: float = Field(
+        18, alias="L2_RETRIEVAL_TIMEOUT_SEC", ge=5, le=25
+    )
+    max_tool_result_chars: int = Field(
+        6_000, alias="L2_MAX_TOOL_RESULT_CHARS", ge=1_000, le=12_000
+    )
+    max_evidence_chars: int = Field(
+        10_000, alias="L2_MAX_EVIDENCE_CHARS", ge=2_000, le=20_000
+    )
+    retrieval_max_tokens: int = Field(
+        512, alias="L2_RETRIEVAL_MAX_TOKENS", ge=256, le=1_024
+    )
     request_timeout_sec: float = Field(
         45, alias="L2_REQUEST_TIMEOUT_SEC", ge=10, le=50
     )
     turn_timeout_sec: float = Field(55, alias="L2_TURN_TIMEOUT_SEC", ge=15, le=60)
     generation_max_tokens: int = Field(
-        1_536, alias="L2_GENERATION_MAX_TOKENS", ge=256, le=2_048
+        2_048, alias="L2_GENERATION_MAX_TOKENS", ge=256, le=2_048
     )
-    max_history_messages: int = Field(4, alias="L2_MAX_HISTORY_MESSAGES", ge=1, le=10)
-    max_message_chars: int = Field(6_000, alias="L2_MAX_MESSAGE_CHARS", ge=500, le=20_000)
+    max_history_messages: int = Field(6, alias="L2_MAX_HISTORY_MESSAGES", ge=2, le=10)
+    max_message_chars: int = Field(4_000, alias="L2_MAX_MESSAGE_CHARS", ge=500, le=10_000)
 
     @property
     def token(self) -> str:

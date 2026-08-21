@@ -39,7 +39,7 @@ class RetrievalResult(BaseModel):
     note: str = ""
     tool_calls: int = 0
 
-    def for_generation(self) -> str:
+    def for_generation(self, max_chars: int = 10_000) -> str:
         lines = [f"status: {self.status}"]
         if self.note:
             lines.append(f"note: {self.note}")
@@ -55,7 +55,7 @@ class RetrievalResult(BaseModel):
             )
         if not self.evidence:
             lines.append("No citable evidence was selected.")
-        return "\n".join(lines)
+        return "\n".join(lines)[:max_chars]
 
 
 class ChatRequest(BaseModel):
