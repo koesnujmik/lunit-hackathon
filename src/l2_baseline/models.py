@@ -30,7 +30,7 @@ class Evidence(BaseModel):
     cite_uid: str
     relevance_score: float
     content: str
-    tfidf_score: float = 0
+    bm25_score: float = 0
 
 
 class RetrievalResult(BaseModel):

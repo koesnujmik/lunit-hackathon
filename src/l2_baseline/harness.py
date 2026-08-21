@@ -118,7 +118,7 @@ def _evidence_context(evidence: list[Evidence]) -> str:
     if not evidence:
         return "No citable evidence yet."
     return "\n\n".join(
-        f"[{index}] cite_uid={item.cite_uid} tfidf={item.tfidf_score:.4f}\n{item.content}"
+        f"[{index}] cite_uid={item.cite_uid} bm25={item.bm25_score:.4f}\n{item.content}"
         for index, item in enumerate(evidence, 1)
     )
 
@@ -166,6 +166,26 @@ class L2Harness:
             max_retries=2,
         )
         self.mcp_factory = mcp_factory
+        self._mcp_tools_cache: list[dict[str, Any]] | None = None
+        self._mcp_tools_lock = asyncio.Lock()
+
+    async def _get_mcp_tools(self, mcp: LunitMCPClient) -> list[dict[str, Any]]:
+        """Cache the static MCP tool schemas for this process-level harness."""
+        started = time.perf_counter()
+        loaded = False
+        try:
+            if self._mcp_tools_cache is None:
+                async with self._mcp_tools_lock:
+                    if self._mcp_tools_cache is None:
+                        self._mcp_tools_cache = await mcp.openai_tools()
+                        loaded = True
+            return self._mcp_tools_cache
+        finally:
+            logger.info(
+                "timing stage=mcp_list_tools cache_hit=%s duration_sec=%.3f",
+                not loaded,
+                time.perf_counter() - started,
+            )
 
     async def _forced_decision(
         self, system_prompt: str, user_content: str, tool: dict[str, Any]
@@ -289,7 +309,7 @@ class L2Harness:
 
     async def retrieve(self, query: str) -> RetrievalResult:
         retrieval_started = time.perf_counter()
-        passage = await self.create_hypothetical_passage(query)
+        passage_task = asyncio.create_task(self.create_hypothetical_passage(query))
         documents: list[str] = []
         action_count = 0
         evidence: list[Evidence] = []
@@ -298,43 +318,54 @@ class L2Harness:
             analysis_summary="Initial selection has not run.",
             next_query=query,
         )
-        mcp_connect_started = time.perf_counter()
-        async with self.mcp_factory(
-            self.settings.mcp_url, self.settings.token, self.settings.request_timeout_sec
-        ) as mcp:
-            logger.info(
-                "timing stage=mcp_connect duration_sec=%.3f",
-                time.perf_counter() - mcp_connect_started,
-            )
-            tool_list_started = time.perf_counter()
-            try:
-                tools = await mcp.openai_tools()
-            finally:
+        try:
+            mcp_connect_started = time.perf_counter()
+            async with self.mcp_factory(
+                self.settings.mcp_url,
+                self.settings.token,
+                self.settings.request_timeout_sec,
+            ) as mcp:
                 logger.info(
-                    "timing stage=mcp_list_tools duration_sec=%.3f",
-                    time.perf_counter() - tool_list_started,
+                    "timing stage=mcp_connect duration_sec=%.3f",
+                    time.perf_counter() - mcp_connect_started,
                 )
-            candidate_tools = rank_tool_candidates(
-                f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
-            )
-            actions = await self._choose_actions(candidate_tools, query, passage)
-            for round_number in range(1, self.settings.max_reflection_rounds + 1):
-                remaining_budget = self.settings.max_retrieval_calls - action_count
-                outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
-                documents.extend(outputs)
-                action_count += len(outputs)
-                evidence = rank_documents(passage, documents, self.settings.retrieval_top_k)
-                reflection = await self._reflect(query, evidence, round_number)
-                if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
-                    break
-                actions = await self._choose_actions(
-                    candidate_tools,
+                tools = await self._get_mcp_tools(mcp)
+                passage = await passage_task
+                candidate_tools = rank_tool_candidates(
                     query,
-                    passage,
-                    evidence=evidence,
-                    observations=documents,
-                    reflection=reflection,
+                    tools,
+                    self.settings.tool_candidate_limit,
+                    rationale=passage,
                 )
+                actions = await self._choose_actions(candidate_tools, query, passage)
+                for round_number in range(1, self.settings.max_reflection_rounds + 1):
+                    remaining_budget = self.settings.max_retrieval_calls - action_count
+                    outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
+                    documents.extend(outputs)
+                    action_count += len(outputs)
+                    evidence = rank_documents(
+                        query,
+                        passage,
+                        documents,
+                    )
+                    reflection = await self._reflect(query, evidence, round_number)
+                    if (
+                        reflection.sufficient
+                        or action_count >= self.settings.max_retrieval_calls
+                    ):
+                        break
+                    actions = await self._choose_actions(
+                        candidate_tools,
+                        query,
+                        passage,
+                        evidence=evidence,
+                        observations=documents,
+                        reflection=reflection,
+                    )
+        finally:
+            if not passage_task.done():
+                passage_task.cancel()
+            await asyncio.gather(passage_task, return_exceptions=True)
         result = await self._finalize(
             query, evidence, reflection.sufficient, reflection.analysis_summary
         )

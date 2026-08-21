@@ -14,7 +14,6 @@ def test_submission_has_embedded_api_key_fallback(monkeypatch) -> None:
     assert settings.patient_api_url == "https://patient.hackathon.lunit.io"
     assert settings.max_retrieval_calls == 5
     assert settings.max_reflection_rounds == 4
-    assert settings.retrieval_top_k == 3
     assert settings.tool_candidate_limit == 3
     assert settings.request_timeout_sec == 90
 

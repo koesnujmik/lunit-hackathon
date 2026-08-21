@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     )
     max_retrieval_calls: int = Field(5, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=30)
     max_reflection_rounds: int = Field(4, alias="L2_MAX_REFLECTION_ROUNDS", ge=1, le=10)
-    retrieval_top_k: int = Field(3, alias="L2_RETRIEVAL_TOP_K", ge=1, le=10)
     tool_candidate_limit: int = Field(3, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=20)
     request_timeout_sec: float = Field(90, alias="L2_REQUEST_TIMEOUT_SEC", ge=10)
 

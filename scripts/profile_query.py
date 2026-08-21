@@ -26,7 +26,10 @@ async def inspect_candidates(
     ) as mcp:
         tools = await mcp.openai_tools()
     candidates = rank_tool_candidates(
-        f"{query}\n{passage}", tools, harness.settings.tool_candidate_limit
+        query,
+        tools,
+        harness.settings.tool_candidate_limit,
+        rationale=passage,
     )
     print(f"HYDE_WORDS={len(passage.split())}")
     for tool in candidates:

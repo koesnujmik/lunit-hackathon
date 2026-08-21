@@ -32,3 +32,19 @@ def test_guideline_query_prefers_index_tools() -> None:
 def test_prefilter_respects_limit() -> None:
     tools = [_tool(f"tool_{index}", f"description {index}") for index in range(10)]
     assert len(rank_tool_candidates("description", tools, limit=6)) == 6
+
+
+def test_tool_hybrid_ranking_uses_query_with_higher_weight() -> None:
+    tools = [
+        _tool("warfarin_tool", "official warfarin interaction"),
+        _tool("aspirin_tool", "aspirin bleeding monitoring"),
+    ]
+
+    selected = rank_tool_candidates(
+        "warfarin interaction",
+        tools,
+        limit=1,
+        rationale="aspirin bleeding monitoring",
+    )
+
+    assert selected[0]["function"]["name"] == "warfarin_tool"
