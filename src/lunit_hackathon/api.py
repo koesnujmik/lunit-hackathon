@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -9,6 +8,19 @@ from typing import Any
 
 class APIError(RuntimeError):
     """Raised when an OpenAI-compatible API request fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "upstream_error",
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 class OpenAICompatibleClient:
@@ -47,32 +59,38 @@ class OpenAICompatibleClient:
             "Content-Type": "application/json",
         }
 
-        last_error: Exception | None = None
-        for attempt in range(3):
-            request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
-                    raw = response.read().decode("utf-8")
-                    return json.loads(raw)
-            except urllib.error.HTTPError as exc:
-                raw_error = exc.read().decode("utf-8", errors="replace")
-                if exc.code in {408, 429, 500, 502, 503, 504} and attempt < 2:
-                    last_error = exc
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                raise APIError(f"POST {url} failed with HTTP {exc.code}: {raw_error}") from exc
-            except TimeoutError as exc:
-                raise APIError(f"POST {url} timed out after {self.timeout_sec:g}s.") from exc
-            except urllib.error.URLError as exc:
-                last_error = exc
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                raise APIError(f"POST {url} failed: {exc}") from exc
-            except json.JSONDecodeError as exc:
-                raise APIError(f"POST {url} returned invalid JSON.") from exc
-
-        raise APIError(f"POST {url} failed after retries: {last_error}")
+        request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code in {408, 429, 500, 502, 503, 504}
+            raise APIError(
+                f"POST {url} failed with HTTP {exc.code}: {raw_error[:1_000]}",
+                kind="http_error",
+                status_code=exc.code,
+                retryable=retryable,
+            ) from exc
+        except TimeoutError as exc:
+            raise APIError(
+                f"POST {url} timed out after {self.timeout_sec:g}s.",
+                kind="timeout",
+                retryable=True,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise APIError(
+                f"POST {url} failed: {exc}",
+                kind="network_error",
+                retryable=True,
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise APIError(
+                f"POST {url} returned invalid JSON.",
+                kind="invalid_json",
+                retryable=True,
+            ) from exc
 
 
 def first_message_content(response: dict[str, Any]) -> str:
@@ -80,7 +98,11 @@ def first_message_content(response: dict[str, Any]) -> str:
     content = message.get("content")
 
     if not isinstance(content, str):
-        raise APIError(f"Expected string message content, got {type(content).__name__}.")
+        raise APIError(
+            f"Expected string message content, got {type(content).__name__}.",
+            kind="invalid_response",
+            retryable=True,
+        )
     return content
 
 
@@ -88,8 +110,16 @@ def first_choice_message(response: dict[str, Any]) -> dict[str, Any]:
     try:
         message = response["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise APIError(f"Unexpected chat completion response shape: {response!r}") from exc
+        raise APIError(
+            f"Unexpected chat completion response shape: {response!r}",
+            kind="invalid_response",
+            retryable=True,
+        ) from exc
 
     if not isinstance(message, dict):
-        raise APIError(f"Expected message object, got {type(message).__name__}.")
+        raise APIError(
+            f"Expected message object, got {type(message).__name__}.",
+            kind="invalid_response",
+            retryable=True,
+        )
     return message

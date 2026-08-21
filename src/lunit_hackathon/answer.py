@@ -54,39 +54,29 @@ def generate_answer(
             )
             answer = first_message_content(response).strip()
             if not answer:
-                raise APIError("L2 returned an empty answer.")
+                raise APIError(
+                    "L2 returned an empty answer.",
+                    kind="empty_response",
+                    retryable=True,
+                )
             _log("l2_complete", attempt=attempt, elapsed_ms=_elapsed_ms(started))
             return answer
         except APIError as exc:
             last_error = exc
+            will_retry = exc.retryable and attempt < len(attempts)
             _log(
-                "l2_retry" if attempt == 1 else "l2_failed",
+                "l2_retry" if will_retry else "l2_failed",
                 attempt=attempt,
                 elapsed_ms=_elapsed_ms(started),
                 error_type=type(exc).__name__,
+                error_kind=exc.kind,
+                status_code=exc.status_code,
+                retryable=exc.retryable,
             )
+            if not will_retry:
+                break
 
     raise last_error or APIError("L2 did not return an answer.")
-
-
-def fallback_answer(conversation: list[dict[str, Any]]) -> str:
-    latest = next(
-        (
-            message.get("content", "")
-            for message in reversed(conversation)
-            if message.get("role") == "user"
-        ),
-        "",
-    )
-    if isinstance(latest, str) and any("가" <= char <= "힣" for char in latest):
-        return (
-            "죄송하지만 지금은 신뢰할 수 있는 답변을 생성하지 못했습니다. "
-            "응급하거나 빠르게 악화되는 증상이 있다면 즉시 119 또는 가까운 의료기관에 연락하세요."
-        )
-    return (
-        "I'm sorry, but I could not generate a reliable answer right now. "
-        "If this may be urgent or symptoms are worsening, contact local emergency services or a clinician."
-    )
 
 
 def _messages(

@@ -8,11 +8,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .answer import fallback_answer, generate_answer
+from .answer import generate_answer
+from .api import APIError
 from .config import load_settings
 
 
-DRIVER_MODEL_ID = "lunit-basic-driver"
+DRIVER_MODEL_ID = "Lunit/L2-preview"
 MAX_REQUEST_BYTES = 2_000_000
 
 
@@ -56,22 +57,47 @@ class ChatHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
             return
+        except APIError as exc:
+            _log_request_failure(
+                exc,
+                error_kind=exc.kind,
+                status_code=exc.status_code,
+                retryable=exc.retryable,
+            )
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": {
+                        "type": "upstream_model_error",
+                        "message": "Lunit L2 did not return a usable response.",
+                    }
+                },
+            )
+            return
+        except RuntimeError as exc:
+            _log_request_failure(exc, error_kind="configuration_error")
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": {
+                        "type": "configuration_error",
+                        "message": "The driver is missing required runtime configuration.",
+                    }
+                },
+            )
+            return
         except Exception as exc:
-            print(
-                json.dumps(
-                    {"event": "request_fallback", "error_type": type(exc).__name__}
-                ),
-                flush=True,
+            _log_request_failure(exc, error_kind="internal_error")
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": {
+                        "type": "internal_error",
+                        "message": "The driver could not complete the request.",
+                    }
+                },
             )
-            fallback_messages = request_body.get("messages", [])
-            normalized_fallback = (
-                [self._normalize_message(message) for message in fallback_messages]
-                if isinstance(fallback_messages, list)
-                else []
-            )
-            response_body = self._completion_response(
-                request_body, fallback_answer(normalized_fallback)
-            )
+            return
 
         self._send_json(HTTPStatus.OK, response_body)
 
@@ -173,9 +199,36 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+def _log_request_failure(exc: Exception, **fields: Any) -> None:
+    print(
+        json.dumps(
+            {
+                "event": "request_failed",
+                "error_type": type(exc).__name__,
+                **fields,
+            }
+        ),
+        flush=True,
+    )
+
+
 def main() -> None:
     host = "0.0.0.0"
     port = 8000
+    settings = load_settings(require_api_key=False)
+    print(
+        json.dumps(
+            {
+                "event": "driver_starting",
+                "host": host,
+                "port": port,
+                "model": settings.fm_model,
+                "fm_api_host": urlparse(settings.fm_api_url).hostname,
+                "api_key_present": bool(settings.fm_api_key),
+            }
+        ),
+        flush=True,
+    )
     server = ThreadingHTTPServer((host, port), ChatHandler)
     server.daemon_threads = True
     print(f"Serving on {host}:{port}", flush=True)

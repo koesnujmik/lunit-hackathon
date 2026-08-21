@@ -3,9 +3,10 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from lunit_hackathon.answer import fallback_answer, generate_answer
+from lunit_hackathon.answer import generate_answer
 from lunit_hackathon.api import APIError
 from lunit_hackathon.config import Settings
+from lunit_hackathon.server import DRIVER_MODEL_ID
 
 
 def settings() -> Settings:
@@ -53,7 +54,7 @@ class BasicDriverTests(unittest.TestCase):
     def test_api_error_retries_once_with_compact_history(self) -> None:
         client = FakeClient(
             [
-                APIError("temporary error"),
+                APIError("temporary error", retryable=True),
                 {"choices": [{"message": {"role": "assistant", "content": "복구 답변"}}]},
             ]
         )
@@ -69,12 +70,29 @@ class BasicDriverTests(unittest.TestCase):
         self.assertEqual(len(client.requests[1]["messages"]), 5)
         self.assertLessEqual(len(client.requests[1]["messages"][-1]["content"]), 2_500)
 
-    def test_last_resort_fallback_matches_basic_language(self) -> None:
-        korean = fallback_answer([{"role": "user", "content": "도와주세요"}])
-        english = fallback_answer([{"role": "user", "content": "Please help"}])
+    def test_two_l2_failures_propagate_without_non_l2_fallback(self) -> None:
+        client = FakeClient(
+            [
+                APIError("temporary error", retryable=True),
+                APIError("still unavailable", retryable=True),
+            ]
+        )
 
-        self.assertIn("죄송", korean)
-        self.assertIn("sorry", english)
+        with self.assertRaisesRegex(APIError, "still unavailable"):
+            generate_answer(settings(), [{"role": "user", "content": "질문"}], client=client)
+
+        self.assertEqual(len(client.requests), 2)
+
+    def test_non_retryable_error_is_not_retried(self) -> None:
+        client = FakeClient([APIError("unauthorized", status_code=401, retryable=False)])
+
+        with self.assertRaisesRegex(APIError, "unauthorized"):
+            generate_answer(settings(), [{"role": "user", "content": "질문"}], client=client)
+
+        self.assertEqual(len(client.requests), 1)
+
+    def test_models_endpoint_advertises_actual_l2_model(self) -> None:
+        self.assertEqual(DRIVER_MODEL_ID, "Lunit/L2-preview")
 
 
 if __name__ == "__main__":

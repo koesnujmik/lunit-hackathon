@@ -12,8 +12,13 @@ POST /v1/chat/completions
 ```
 
 MCP, retrieval, router, planner, reflection agent를 사용하지 않습니다. 첫 호출이 API 오류나
-입력 길이 문제로 실패할 때만 최근 4개 메시지로 한 번 재시도합니다. 두 호출이 모두 실패하면
-benchmark 전체가 중단되지 않도록 해당 요청에 안전한 fallback 응답을 반환합니다.
+입력 길이 문제로 실패할 때만 최근 4개 메시지로 한 번 재시도합니다. 인증 오류처럼 재시도로
+해결되지 않는 오류는 즉시 종료합니다. 정상 assistant 응답은 항상 Lunit L2가 생성하며, L2가
+최종적으로 실패하면 고정 문장을 대신 반환하지 않고 OpenAI-compatible error response를 보냅니다.
+
+시작 로그의 `driver_starting` 이벤트에는 API key 값이 아닌 존재 여부와 Model API host만
+기록됩니다. 요청 실패 시 `request_failed` 이벤트에서 오류 종류와 upstream HTTP status를
+확인할 수 있습니다.
 
 ## Environment
 
