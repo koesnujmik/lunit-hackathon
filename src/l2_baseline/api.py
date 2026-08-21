@@ -3,6 +3,7 @@ import uuid
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 from .harness import L2Harness
 from .models import (
@@ -58,6 +59,10 @@ async def create_chat_completion(request: ChatCompletionRequest) -> ChatCompleti
         answer = await get_harness().chat(messages)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except APITimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Lunit L2 upstream timed out") from exc
+    except (APIConnectionError, APIStatusError) as exc:
+        raise HTTPException(status_code=502, detail="Lunit L2 upstream unavailable") from exc
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),

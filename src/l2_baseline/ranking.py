@@ -1,6 +1,7 @@
 import math
 import re
 from collections import Counter
+from typing import Any
 
 from .models import Evidence
 
@@ -9,7 +10,43 @@ CITE_PATTERN = re.compile(r"cite[_-]uid[\"\s:=]+[\"']?([A-Za-z0-9_-]+)", re.IGNO
 
 
 def _tokens(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_PATTERN.findall(text) if len(token) > 1]
+    return [token.lower() for token in TOKEN_PATTERN.findall(text.replace("_", " ")) if len(token) > 1]
+
+
+def rank_tool_candidates(
+    search_text: str, tools: list[dict[str, Any]], limit: int = 6
+) -> list[dict[str, Any]]:
+    """Lexically prefilter tool schemas; the L2 selector still makes the action decision."""
+    if len(tools) <= limit:
+        return tools
+    tool_texts = [
+        " ".join(
+            [
+                tool["function"]["name"],
+                tool["function"].get("description", ""),
+                " ".join(tool["function"].get("parameters", {}).get("properties", {})),
+            ]
+        )
+        for tool in tools
+    ]
+    tokenized = [_tokens(search_text), *(_tokens(text) for text in tool_texts)]
+    frequencies = Counter(token for tokens in tokenized[1:] for token in set(tokens))
+    idf = {
+        token: math.log((1 + len(tools)) / (1 + frequency)) + 1
+        for token, frequency in frequencies.items()
+    }
+    query_counts = Counter(tokenized[0])
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for index, (tool, tokens) in enumerate(zip(tools, tokenized[1:], strict=True)):
+        counts = Counter(tokens)
+        score = sum(
+            query_counts[token] * count * idf.get(token, 1) ** 2
+            for token, count in counts.items()
+            if token in query_counts
+        )
+        scored.append((score, -index, tool))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored[:limit]]
 
 
 def rank_documents(passage: str, documents: list[str], top_k: int = 3) -> list[Evidence]:

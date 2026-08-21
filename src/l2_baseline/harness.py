@@ -14,7 +14,7 @@ from .prompts import (
     REFLECTION_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
-from .ranking import rank_documents
+from .ranking import rank_documents, rank_tool_candidates
 
 
 def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -244,7 +244,10 @@ class L2Harness:
             self.settings.mcp_url, self.settings.token, self.settings.request_timeout_sec
         ) as mcp:
             tools = await mcp.openai_tools()
-            actions = await self._choose_actions(tools, query, passage)
+            candidate_tools = rank_tool_candidates(
+                f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
+            )
+            actions = await self._choose_actions(candidate_tools, query, passage)
             for round_number in range(1, self.settings.max_reflection_rounds + 1):
                 for action in actions:
                     if action_count >= self.settings.max_retrieval_calls:
@@ -257,7 +260,7 @@ class L2Harness:
                 if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
                     break
                 actions = await self._choose_actions(
-                    tools,
+                    candidate_tools,
                     query,
                     passage,
                     evidence=evidence,

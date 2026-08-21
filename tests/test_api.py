@@ -1,4 +1,8 @@
+from unittest.mock import AsyncMock
+
 from fastapi.testclient import TestClient
+from httpx import Request, Response
+from openai import InternalServerError
 
 from l2_baseline import api
 
@@ -51,3 +55,23 @@ def test_streaming_is_rejected() -> None:
         },
     )
     assert response.status_code == 400
+
+
+def test_upstream_failure_is_reported_as_bad_gateway(monkeypatch: object) -> None:
+    harness = FakeHarness()
+    harness.chat = AsyncMock(
+        side_effect=InternalServerError(
+            "upstream unavailable",
+            response=Response(502, request=Request("POST", "https://model.test")),
+            body=None,
+        )
+    )
+    monkeypatch.setattr(api, "_harness", harness)  # type: ignore[attr-defined]
+    response = TestClient(api.app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "Lunit/L2-preview",
+            "messages": [{"role": "user", "content": "question"}],
+        },
+    )
+    assert response.status_code == 502
