@@ -45,3 +45,39 @@ PYTHONPATH=src python -m lunit_hackathon.run_simulator --turns 3
 ```
 
 Simulator logs are written under `logs/` and are ignored by git.
+
+## Submission Service
+
+The submitted container serves an OpenAI-compatible API on port `8000`:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+Run locally without Docker:
+
+```bash
+source .env
+PYTHONPATH=src python -m lunit_hackathon.server
+```
+
+Build and run the submission container:
+
+```bash
+docker build -t lunit-hackathon:local .
+docker run --rm --env-file .env -p 8000:8000 lunit-hackathon:local
+```
+
+Smoke test:
+
+```bash
+curl http://localhost:8000/v1/models
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"lunit-basic-driver","messages":[{"role":"user","content":"기침과 열이 있습니다. 어떻게 해야 하나요?"}]}'
+```
+
+Submit the full 40-character SHA from the submission branch:
+
+```bash
+git rev-parse HEAD
+```
