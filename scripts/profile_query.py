@@ -6,6 +6,7 @@ import time
 
 from l2_baseline.harness import L2Harness
 from l2_baseline.mcp_client import LunitMCPClient
+from l2_baseline.pipelines import PIPELINE_ROOT_TOOLS, tools_by_name
 from l2_baseline.ranking import rank_tool_candidates
 
 
@@ -22,6 +23,7 @@ async def inspect_candidates(
         f"{time.perf_counter() - assessment_started:.3f}",
     )
     print("QUERY_SUFFICIENT=", assessment.query_sufficient)
+    print("PIPELINE_TYPE=", assessment.pipeline_type)
     print("QUERY_ASSESSMENT_REASON=", assessment.reason)
 
     rationale = ""
@@ -41,13 +43,19 @@ async def inspect_candidates(
         harness.settings.request_timeout_sec,
     ) as mcp:
         tools = await mcp.openai_tools()
-    candidates = rank_tool_candidates(
-        query,
-        tools,
-        harness.settings.tool_candidate_limit,
-        rationale=rationale,
-    )
-    print(f"TOOL_SCHEMA_BM25_TOP_K={len(candidates)}")
+    if assessment.pipeline_type == "direct":
+        candidates = rank_tool_candidates(
+            query,
+            tools,
+            harness.settings.tool_candidate_limit,
+            rationale=rationale,
+        )
+        print(f"TOOL_SCHEMA_BM25_TOP_K={len(candidates)}")
+    else:
+        candidates = tools_by_name(
+            tools, PIPELINE_ROOT_TOOLS[assessment.pipeline_type]
+        )
+        print(f"PIPELINE_ROOT_TOOL_COUNT={len(candidates)}")
     for tool in candidates:
         print(
             "CANDIDATE",

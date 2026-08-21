@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias, get_args
 
 from pydantic import BaseModel, Field
 
@@ -20,8 +20,22 @@ class PlanDecision(BaseModel):
     reason: str = ""
 
 
+RetrievalPipeline: TypeAlias = Literal[
+    "direct",
+    "index",
+    "law",
+    "rag_sql",
+    "rag_vector",
+    "drug_label",
+    "drug_substitution",
+    "kcd_billing",
+]
+RETRIEVAL_PIPELINES = tuple(get_args(RetrievalPipeline))
+
+
 class RetrievalQueryDecision(BaseModel):
     query_sufficient: bool
+    pipeline_type: RetrievalPipeline = "direct"
     reason: str = ""
 
 

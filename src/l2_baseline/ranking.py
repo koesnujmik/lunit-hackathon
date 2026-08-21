@@ -114,6 +114,25 @@ def rank_tool_candidates(
     return [item[2] for item in scored[:limit]]
 
 
+def rank_text_candidates(
+    query: str,
+    rationale: str,
+    candidates: list[tuple[str, str]],
+    limit: int,
+) -> list[str]:
+    """Rank identifier/text pairs while returning only their identifiers."""
+    if not candidates or limit <= 0:
+        return []
+    tokenized = [_tokens(text) for _, text in candidates]
+    scores = _hybrid_bm25_scores(query, rationale, tokenized)
+    ranked = sorted(
+        zip(candidates, scores, strict=True),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return [candidate[0] for candidate, _ in ranked[:limit]]
+
+
 def rank_documents(query: str, rationale: str, documents: list[str]) -> list[Evidence]:
     """Rank citable MCP results and retain the two best retrieval contexts."""
     if not documents:

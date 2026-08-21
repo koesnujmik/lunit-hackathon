@@ -6,19 +6,36 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
 ## 처리 흐름
 
 1. Router가 전체 대화 문맥을 보고 memory 답변과 retrieval 필요 여부를 결정합니다.
-2. Retrieval이 필요하면 멀티턴 문맥이 해결된 query가 그 자체로 tool 선택과
-   ranking에 충분한지 판단합니다.
-3. Query가 부족한 경우에만 L2가 필요한 근거·용어·출처 조건을 정리한 짧은
-   retrieval rationale를 생성합니다. Rationale는 검색 보조 정보일 뿐 evidence로
-   인용하지 않습니다.
-4. Query와 선택적 rationale를 기준으로 MCP tool schema를 BM25 정렬하고 Top-5만
-   selector에 제공합니다.
-5. Selector가 직접 유용한 action을 최대 5개 선택하면, 한 번의 batch로 병렬
-   실행합니다.
-6. Query가 충분했다면 query-only BM25를, rationale가 필요했다면 query+rationale
-   BM25를 사용해 `cite_uid`가 있는 MCP context Top-2를 선정합니다.
-7. `finalize_retrieval`이 최종 citation과 근거 충분성을 확정하고, L2가 선택된 context로
-   최종 답변을 생성합니다.
+2. Retrieval이 필요하면 agent가 멀티턴 문맥이 해결된 query만으로 tool argument 생성과
+   결과 ranking이 충분한지 `query_sufficient`로 판단합니다. 별도의 결정론적 router가
+   명시된 source·질문 유형으로 `pipeline_type`을 확정합니다.
+3. `query_sufficient=false`일 때만 L2가 필요한 근거·용어·출처 조건을 정리한
+   짧은 retrieval rationale를 한 번 생성합니다. Rationale는 검색 보조 정보일 뿐
+   evidence로 인용하지 않습니다.
+4. `pipeline_type=direct`면 query와 선택적 rationale로 MCP tool schema를 BM25 정렬해
+   Top-5만 selector에 제공합니다. Selector는 최대 5개 action을 고르고, 선택된
+   action은 단일 batch로 병렬 실행됩니다.
+5. Specialized pipeline은 `index`, `law`, `rag_sql`, `rag_vector`, `drug_label`,
+   `drug_substitution`, `kcd_billing`입니다. 각 pipeline은 미리 정해진 bounded stage만
+   실행하며 전체 MCP 호출은 최대 5번입니다.
+6. 모든 pipeline 결과는 query-only 또는 query+rationale BM25로 정렬하고,
+   `cite_uid`가 있는 context Top-2만 유지합니다.
+7. `finalize_retrieval`이 최종 citation과 근거 충분성을 확정하고, L2가 선택된
+   context로 최종 답변을 생성합니다.
+
+이 retrieval은 ReAct나 Reflection 반복 루프를 사용하지 않습니다. Direct와 specialized
+pipeline 모두 stage와 MCP 호출 수가 고정 상한 안에서 종료됩니다.
+
+| `pipeline_type` | 고정 실행 경로 |
+|---|---|
+| `direct` | BM25 schema Top-5 → selector → 단일 병렬 batch |
+| `index` | relevant-node/keyword 검색 → 반환된 `doc_id`·page range의 원문 조회 |
+| `law` | 법령명 검색 → `mst` 조문 목록 → 선택한 `article_keys` 전문 조회 |
+| `rag_sql` | 고정 SQL source schema → schema 기반 SQL 조회 |
+| `rag_vector` | 고정 vector source metadata → semantic 조회 |
+| `drug_label` | MFDS 한국 제품 → `ingredient_eng` → DailyMed label |
+| `drug_substitution` | MFDS 성분 확인 → 동일성분 제품 → 후보 적응증 |
+| `kcd_billing` | 질병명 code 검색 → 공식 명칭·HIRA 청구 유효성 병렬 확인 |
 
 MCP tool schema는 프로세스 수명 동안 캐싱하여 첫 retrieval 이후에는 `list_tools`
 네트워크 호출을 반복하지 않습니다.

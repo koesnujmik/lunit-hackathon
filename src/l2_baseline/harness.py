@@ -9,14 +9,34 @@ from openai import AsyncOpenAI
 
 from .config import Settings
 from .mcp_client import LunitMCPClient
-from .models import CitationSelection, Evidence, RetrievalQueryDecision, RetrievalResult
+from .models import (
+    CitationSelection,
+    Evidence,
+    RetrievalPipeline,
+    RetrievalQueryDecision,
+    RetrievalResult,
+)
+from .pipelines import (
+    PIPELINE_HINTS,
+    PIPELINE_ROOT_TOOLS,
+    article_entries,
+    english_ingredients,
+    identifier_entries,
+    kcd_candidates,
+    make_action,
+    page_targets,
+    product_names,
+    select_pipeline_type,
+    tools_by_name,
+)
 from .prompts import (
     GENERATION_SYSTEM_PROMPT,
+    PIPELINE_ACTION_SYSTEM_PROMPT,
     QUERY_ASSESSMENT_SYSTEM_PROMPT,
     RETRIEVAL_RATIONALE_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
-from .ranking import rank_documents, rank_tool_candidates
+from .ranking import rank_documents, rank_text_candidates, rank_tool_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +242,8 @@ class L2Harness:
             f"QUERY:\n{query}",
             QUERY_ASSESSMENT_TOOL,
         )
-        return RetrievalQueryDecision.model_validate(arguments)
+        decision = RetrievalQueryDecision.model_validate(arguments)
+        return decision.model_copy(update={"pipeline_type": select_pipeline_type(query)})
 
     async def create_retrieval_rationale(self, query: str) -> str:
         started = time.perf_counter()
@@ -272,6 +293,204 @@ class L2Harness:
             )
         return response.choices[0].message.tool_calls or []
 
+    async def _choose_pipeline_actions(
+        self,
+        tools: list[dict[str, Any]],
+        query: str,
+        rationale: str,
+        pipeline_type: RetrievalPipeline,
+        upstream_context: str = "",
+    ) -> list[Any]:
+        if not tools:
+            return []
+        content = (
+            f"QUERY:\n{query}\n\nPIPELINE TYPE:\n{pipeline_type}"
+            f"\n\nFIXED-STAGE INSTRUCTION:\n{PIPELINE_HINTS[pipeline_type]}"
+        )
+        if rationale:
+            content += f"\n\nRETRIEVAL RATIONALE:\n{rationale}"
+        if upstream_context:
+            content += f"\n\nUPSTREAM TOOL DATA:\n{upstream_context[-12000:]}"
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=[
+                    {"role": "system", "content": PIPELINE_ACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+                tools=tools,
+                tool_choice="auto",
+                temperature=0,
+            )
+        finally:
+            logger.info(
+                "timing stage=pipeline_action_selection pipeline=%s duration_sec=%.3f",
+                pipeline_type,
+                time.perf_counter() - started,
+            )
+        return response.choices[0].message.tool_calls or []
+
+    async def _execute_pipeline(
+        self,
+        mcp: LunitMCPClient,
+        tools: list[dict[str, Any]],
+        pipeline_type: RetrievalPipeline,
+        query: str,
+        rationale: str,
+    ) -> tuple[list[str], int]:
+        documents: list[str] = []
+        action_count = 0
+        seen_actions: set[tuple[str, str]] = set()
+        available_names = {tool["function"]["name"] for tool in tools}
+
+        async def run_batch(actions: list[Any]) -> list[tuple[Any, str]]:
+            nonlocal action_count
+            remaining = self.settings.max_retrieval_calls - action_count
+            selected: list[Any] = []
+            for action in actions:
+                if len(selected) >= remaining:
+                    break
+                name = action.function.name
+                raw_arguments = action.function.arguments
+                key = (name, raw_arguments)
+                if key in seen_actions:
+                    continue
+                seen_actions.add(key)
+                selected.append(action)
+            outputs = await _run_mcp_actions(mcp, selected, remaining)
+            action_count += len(outputs)
+            documents.extend(outputs)
+            return list(zip(selected, outputs, strict=True))
+
+        root_tools = tools_by_name(tools, PIPELINE_ROOT_TOOLS[pipeline_type])
+        root_actions = await self._choose_pipeline_actions(
+            root_tools,
+            query,
+            rationale,
+            pipeline_type,
+        )
+        root_limit = 2 if pipeline_type == "index" else 1
+        root_pairs = await run_batch(root_actions[:root_limit])
+        root_outputs = [output for _, output in root_pairs if output]
+        if not root_pairs or action_count >= self.settings.max_retrieval_calls:
+            return documents, action_count
+
+        if pipeline_type == "index":
+            if "index_get_page_content" not in available_names:
+                return documents, action_count
+            targets = page_targets(root_pairs)
+            actions = [
+                make_action(
+                    "index_get_page_content",
+                    {
+                        "corpus_tag": target.corpus_tag,
+                        "doc_id": target.doc_id,
+                        "start_page": target.start_page,
+                        "end_page": target.end_page,
+                    },
+                )
+                for target in targets
+            ]
+            await run_batch(actions)
+
+        elif pipeline_type == "law":
+            if not {
+                "openapi_law_list_articles",
+                "openapi_law_get_article",
+            }.issubset(available_names):
+                return documents, action_count
+            mst_entries = identifier_entries(root_outputs, "mst")
+            msts = rank_text_candidates(query, rationale, mst_entries, limit=1)
+            if not msts:
+                return documents, action_count
+            list_pairs = await run_batch(
+                [make_action("openapi_law_list_articles", {"mst": msts[0]})]
+            )
+            entries = article_entries(output for _, output in list_pairs)
+            article_keys = rank_text_candidates(query, rationale, entries, limit=5)
+            if article_keys:
+                await run_batch(
+                    [
+                        make_action(
+                            "openapi_law_get_article",
+                            {"mst": msts[0], "article_keys": article_keys},
+                        )
+                    ]
+                )
+
+        elif pipeline_type in {"rag_sql", "rag_vector"}:
+            if not root_outputs:
+                return documents, action_count
+            terminal_name = (
+                "rag_sql_query" if pipeline_type == "rag_sql" else "rag_vector_query"
+            )
+            terminal_tools = tools_by_name(tools, [terminal_name])
+            terminal_actions = await self._choose_pipeline_actions(
+                terminal_tools,
+                query,
+                rationale,
+                pipeline_type,
+                upstream_context="\n\n".join(root_outputs),
+            )
+            await run_batch(terminal_actions)
+
+        elif pipeline_type == "drug_label":
+            if "adr_retrieve_drug_info" not in available_names:
+                return documents, action_count
+            ingredients = english_ingredients(root_outputs)
+            actions = [
+                make_action("adr_retrieve_drug_info", {"drug_name": ingredient})
+                for ingredient in ingredients[:2]
+            ]
+            await run_batch(actions)
+
+        elif pipeline_type == "drug_substitution":
+            if not {
+                "openapi_mfds_find_drugs_by_ingredient",
+                "openapi_mfds_get_drug_indication",
+            }.issubset(available_names):
+                return documents, action_count
+            ingredients = english_ingredients(root_outputs)
+            if not ingredients:
+                return documents, action_count
+            alternative_pairs = await run_batch(
+                [
+                    make_action(
+                        "openapi_mfds_find_drugs_by_ingredient",
+                        {"ingredient": ingredients[0]},
+                    )
+                ]
+            )
+            alternatives = product_names(output for _, output in alternative_pairs)
+            actions = [
+                make_action(
+                    "openapi_mfds_get_drug_indication",
+                    {"drug_name": product_name, "num_rows": 1},
+                )
+                for product_name in alternatives
+            ]
+            await run_batch(actions)
+
+        elif pipeline_type == "kcd_billing":
+            candidates = kcd_candidates(root_outputs)[:2]
+            actions = []
+            for code, revision in candidates:
+                if "kcd_get_name" in available_names:
+                    arguments = {"code": code}
+                    if revision:
+                        arguments["revision"] = revision
+                    actions.append(make_action("kcd_get_name", arguments))
+                if "openapi_hira_disease_check_code" in available_names:
+                    actions.append(
+                        make_action(
+                            "openapi_hira_disease_check_code", {"code": code}
+                        )
+                    )
+            await run_batch(actions)
+
+        return documents, action_count
+
     async def _finalize(
         self, query: str, evidence: list[Evidence], note: str
     ) -> RetrievalResult:
@@ -279,7 +498,7 @@ class L2Harness:
             return RetrievalResult(status="no_evidence", note=note)
         content = (
             f"Query: {query}\n\nCandidates:\n{_evidence_context(evidence)}\n\n"
-            "The single-pass retrieval is complete. Determine evidence sufficiency and call "
+            "The bounded retrieval pipeline is complete. Determine evidence sufficiency and call "
             "finalize_retrieval now."
         )
         arguments = await self._forced_decision(
@@ -320,18 +539,29 @@ class L2Harness:
                 decision = await assessment_task
                 if not decision.query_sufficient:
                     rationale = await self.create_retrieval_rationale(query)
-                candidate_tools = rank_tool_candidates(
-                    query,
-                    tools,
-                    self.settings.tool_candidate_limit,
-                    rationale=rationale,
-                )
-                actions = await self._choose_actions(candidate_tools, query, rationale)
-                outputs = await _run_mcp_actions(
-                    mcp, actions, self.settings.max_retrieval_calls
-                )
-                documents.extend(outputs)
-                action_count = len(outputs)
+                if decision.pipeline_type == "direct":
+                    candidate_tools = rank_tool_candidates(
+                        query,
+                        tools,
+                        self.settings.tool_candidate_limit,
+                        rationale=rationale,
+                    )
+                    actions = await self._choose_actions(
+                        candidate_tools, query, rationale
+                    )
+                    outputs = await _run_mcp_actions(
+                        mcp, actions, self.settings.max_retrieval_calls
+                    )
+                    documents.extend(outputs)
+                    action_count = len(outputs)
+                else:
+                    documents, action_count = await self._execute_pipeline(
+                        mcp,
+                        tools,
+                        decision.pipeline_type,
+                        query,
+                        rationale,
+                    )
                 evidence = rank_documents(query, rationale, documents)
         finally:
             if not assessment_task.done():
@@ -339,7 +569,8 @@ class L2Harness:
             await asyncio.gather(assessment_task, return_exceptions=True)
 
         strategy = "query-only" if decision and decision.query_sufficient else "query+rationale"
-        note = f"Single-pass {strategy} retrieval."
+        pipeline_type = decision.pipeline_type if decision else "direct"
+        note = f"Bounded {pipeline_type} pipeline using {strategy} retrieval."
         if decision and decision.reason:
             note += f" Query assessment: {decision.reason}"
         result = await self._finalize(query, evidence, note)
