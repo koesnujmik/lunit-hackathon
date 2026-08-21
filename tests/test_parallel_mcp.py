@@ -20,6 +20,13 @@ class ConcurrentMCP:
         return f"{name}:{arguments['query']}"
 
 
+class PartiallyFailingMCP(ConcurrentMCP):
+    async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        if name == "broken":
+            raise RuntimeError("tool unavailable")
+        return await super().call(name, arguments)
+
+
 def _action(name: str) -> SimpleNamespace:
     return SimpleNamespace(
         function=SimpleNamespace(name=name, arguments=f'{{"query":"{name}"}}')
@@ -44,3 +51,14 @@ def test_mcp_actions_respect_remaining_budget() -> None:
 
     assert mcp.called == ["first", "second"]
     assert len(outputs) == 2
+
+
+def test_failed_action_does_not_discard_successful_contexts() -> None:
+    mcp = PartiallyFailingMCP()
+    actions = [_action("first"), _action("broken"), _action("third")]
+
+    outputs = asyncio.run(
+        _run_mcp_actions(mcp, actions, remaining_budget=3)  # type: ignore[arg-type]
+    )
+
+    assert outputs == ["first:first", "", "third:third"]

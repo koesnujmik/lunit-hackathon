@@ -20,10 +20,9 @@ class PlanDecision(BaseModel):
     reason: str = ""
 
 
-class ReflectionDecision(BaseModel):
-    sufficient: bool
-    analysis_summary: str
-    next_query: str = ""
+class RetrievalQueryDecision(BaseModel):
+    query_sufficient: bool
+    reason: str = ""
 
 
 class Evidence(BaseModel):

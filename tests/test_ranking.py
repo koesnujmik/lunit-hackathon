@@ -1,7 +1,7 @@
 from l2_baseline.ranking import rank_documents
 
 
-def test_bm25_returns_only_relevant_citable_candidates() -> None:
+def test_bm25_returns_only_citable_top_two() -> None:
     passage = "만성 신장질환 chronic kidney disease blood pressure target"
     documents = [
         '{"cite_uid":"cite-a","content":"chronic kidney disease blood pressure target"}',
@@ -11,10 +11,9 @@ def test_bm25_returns_only_relevant_citable_candidates() -> None:
         '{"content":"highly similar chronic kidney disease but not citable"}',
     ]
     ranked = rank_documents(passage, passage, documents)
-    assert 2 <= len(ranked) <= 5
-    assert ranked[0].cite_uid == "cite-a"
+    assert [item.cite_uid for item in ranked] == ["cite-a", "cite-b"]
     assert ranked[0].bm25_score > 0
-    assert all(item.cite_uid != "cite-d" for item in ranked[:2])
+    assert all(item.cite_uid != "cite-d" for item in ranked)
 
 
 def test_bm25_empty_documents() -> None:
@@ -56,20 +55,18 @@ def test_hybrid_bm25_uses_query_and_rationale_with_query_priority() -> None:
     assert ranked[1].bm25_score == 0.35
 
 
-def test_adaptive_cutoff_keeps_minimum_two_candidates() -> None:
+def test_bm25_returns_only_available_citable_candidate() -> None:
     documents = [
         '{"cite_uid":"cite-match","content":"warfarin interaction"}',
-        '{"cite_uid":"cite-noise-a","content":"unrelated dermatology"}',
-        '{"cite_uid":"cite-noise-b","content":"unrelated orthopedics"}',
+        '{"content":"warfarin interaction but not citable"}',
     ]
 
     ranked = rank_documents("warfarin interaction", "", documents)
 
-    assert len(ranked) == 2
-    assert ranked[0].cite_uid == "cite-match"
+    assert [item.cite_uid for item in ranked] == ["cite-match"]
 
 
-def test_adaptive_cutoff_caps_candidates_at_five() -> None:
+def test_bm25_caps_candidates_at_two() -> None:
     documents = [
         f'{{"cite_uid":"cite-{index}","content":"warfarin interaction"}}'
         for index in range(7)
@@ -77,4 +74,4 @@ def test_adaptive_cutoff_caps_candidates_at_five() -> None:
 
     ranked = rank_documents("warfarin interaction", "", documents)
 
-    assert len(ranked) == 5
+    assert len(ranked) == 2

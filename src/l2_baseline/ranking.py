@@ -11,10 +11,7 @@ BM25_K1 = 1.5
 BM25_B = 0.75
 QUERY_WEIGHT = 0.65
 RATIONALE_WEIGHT = 0.35
-ABSOLUTE_SCORE_CUTOFF = 0.15
-RELATIVE_SCORE_CUTOFF = 0.35
-MIN_EVIDENCE_CANDIDATES = 2
-MAX_EVIDENCE_CANDIDATES = 5
+RAG_CONTEXT_LIMIT = 2
 
 
 def _tokens(text: str) -> list[str]:
@@ -118,7 +115,7 @@ def rank_tool_candidates(
 
 
 def rank_documents(query: str, rationale: str, documents: list[str]) -> list[Evidence]:
-    """Rank citable MCP results and retain an adaptive evidence candidate set."""
+    """Rank citable MCP results and retain the two best retrieval contexts."""
     if not documents:
         return []
     tokenized_documents = [_tokens(document) for document in documents]
@@ -136,17 +133,4 @@ def rank_documents(query: str, rationale: str, documents: list[str]) -> list[Evi
                 )
             )
     ranked.sort(key=lambda item: item.bm25_score, reverse=True)
-    if not ranked:
-        return []
-
-    cutoff = max(
-        ABSOLUTE_SCORE_CUTOFF,
-        ranked[0].bm25_score * RELATIVE_SCORE_CUTOFF,
-    )
-    passing_count = sum(item.bm25_score >= cutoff for item in ranked)
-    candidate_count = min(
-        MAX_EVIDENCE_CANDIDATES,
-        max(MIN_EVIDENCE_CANDIDATES, passing_count),
-        len(ranked),
-    )
-    return ranked[:candidate_count]
+    return ranked[:RAG_CONTEXT_LIMIT]

@@ -4,11 +4,8 @@ import json
 import logging
 import time
 
-from openai import AsyncOpenAI
-
 from l2_baseline.harness import L2Harness
 from l2_baseline.mcp_client import LunitMCPClient
-from l2_baseline.prompts import TOOL_SELECTOR_SYSTEM_PROMPT
 from l2_baseline.ranking import rank_tool_candidates
 
 
@@ -18,7 +15,26 @@ async def inspect_candidates(
     test_auto_selector: bool = False,
 ) -> None:
     harness = L2Harness()
-    passage = await harness.create_hypothetical_passage(query)
+    assessment_started = time.perf_counter()
+    assessment = await harness._assess_retrieval_query(query)
+    print(
+        "QUERY_SUFFICIENCY duration_sec=",
+        f"{time.perf_counter() - assessment_started:.3f}",
+    )
+    print("QUERY_SUFFICIENT=", assessment.query_sufficient)
+    print("QUERY_ASSESSMENT_REASON=", assessment.reason)
+
+    rationale = ""
+    if not assessment.query_sufficient:
+        rationale_started = time.perf_counter()
+        rationale = await harness.create_retrieval_rationale(query)
+        print(
+            "RETRIEVAL_RATIONALE duration_sec=",
+            f"{time.perf_counter() - rationale_started:.3f}",
+        )
+    print("RETRIEVAL_RATIONALE_USED=", bool(rationale))
+    print(f"RETRIEVAL_RATIONALE_WORDS={len(rationale.split())}")
+
     async with LunitMCPClient(
         harness.settings.mcp_url,
         harness.settings.token,
@@ -29,9 +45,9 @@ async def inspect_candidates(
         query,
         tools,
         harness.settings.tool_candidate_limit,
-        rationale=passage,
+        rationale=rationale,
     )
-    print(f"HYDE_WORDS={len(passage.split())}")
+    print(f"TOOL_SCHEMA_BM25_TOP_K={len(candidates)}")
     for tool in candidates:
         print(
             "CANDIDATE",
@@ -40,51 +56,31 @@ async def inspect_candidates(
             len(json.dumps(tool, ensure_ascii=False)),
         )
     if test_single_selector or test_auto_selector:
-        daily_med_tool = next(
-            tool
-            for tool in candidates
-            if tool["function"]["name"] == "adr_retrieve_drug_info"
-        )
-        async with AsyncOpenAI(
-            api_key=harness.settings.token,
-            base_url=harness.settings.api_url.rstrip("/") + "/v1",
-            timeout=45,
-            max_retries=0,
-        ) as client:
-            if test_single_selector:
-                test_harness = L2Harness(settings=harness.settings, client=client)
-                started = time.perf_counter()
-                try:
-                    actions = await test_harness._choose_actions(
-                        [daily_med_tool], query, passage
-                    )
-                finally:
-                    print(
-                        "SINGLE_SELECTOR duration_sec=",
-                        f"{time.perf_counter() - started:.3f}",
-                    )
-                print("SINGLE_SELECTOR actions=", [call.function.name for call in actions])
-            if test_auto_selector:
-                started = time.perf_counter()
-                response = await client.chat.completions.create(
-                    model=harness.settings.model,
-                    messages=[
-                        {"role": "system", "content": TOOL_SELECTOR_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}",
-                        },
-                    ],
-                    tools=[daily_med_tool],
-                    tool_choice="auto",
-                    temperature=0,
+        if test_single_selector:
+            started = time.perf_counter()
+            try:
+                actions = await harness._choose_actions(
+                    candidates[:1], query, rationale
                 )
+            finally:
                 print(
-                    "AUTO_SELECTOR duration_sec=",
+                    "SINGLE_SELECTOR duration_sec=",
                     f"{time.perf_counter() - started:.3f}",
                 )
-                calls = response.choices[0].message.tool_calls or []
-                print("AUTO_SELECTOR actions=", [call.function.name for call in calls])
+            print("SINGLE_SELECTOR actions=", [call.function.name for call in actions])
+        if test_auto_selector:
+            started = time.perf_counter()
+            try:
+                actions = await harness._choose_actions(candidates, query, rationale)
+            finally:
+                print(
+                    "BATCH_SELECTOR duration_sec=",
+                    f"{time.perf_counter() - started:.3f}",
+                )
+            print(
+                "BATCH_SELECTOR actions=",
+                [call.function.name for call in actions[:5]],
+            )
 
 
 async def profile(query: str) -> None:

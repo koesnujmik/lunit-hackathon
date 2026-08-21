@@ -9,12 +9,11 @@ from openai import AsyncOpenAI
 
 from .config import Settings
 from .mcp_client import LunitMCPClient
-from .models import CitationSelection, Evidence, ReflectionDecision, RetrievalResult
+from .models import CitationSelection, Evidence, RetrievalQueryDecision, RetrievalResult
 from .prompts import (
     GENERATION_SYSTEM_PROMPT,
-    HYDE_SYSTEM_PROMPT,
-    REACT_ACTION_SYSTEM_PROMPT,
-    REFLECTION_SYSTEM_PROMPT,
+    QUERY_ASSESSMENT_SYSTEM_PROMPT,
+    RETRIEVAL_RATIONALE_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
 from .ranking import rank_documents, rank_tool_candidates
@@ -43,13 +42,12 @@ RETRIEVE_TOOL = _decision_tool(
     "Retrieve real evidence. Pass one self-contained query that resolves conversation context.",
     {"query": {"type": "string"}},
 )
-REFLECTION_TOOL = _decision_tool(
-    "submit_reflection",
-    "Submit evidence sufficiency and the next retrieval query.",
+QUERY_ASSESSMENT_TOOL = _decision_tool(
+    "submit_query_assessment",
+    "Decide whether the query alone is sufficient for retrieval and ranking.",
     {
-        "sufficient": {"type": "boolean"},
-        "analysis_summary": {"type": "string"},
-        "next_query": {"type": "string"},
+        "query_sufficient": {"type": "boolean"},
+        "reason": {"type": "string"},
     },
 )
 FINALIZE_TOOL = _decision_tool(
@@ -126,7 +124,7 @@ def _evidence_context(evidence: list[Evidence]) -> str:
 async def _run_mcp_actions(
     mcp: LunitMCPClient, actions: list[Any], remaining_budget: int
 ) -> list[str]:
-    """Run one round's MCP actions concurrently while preserving action order."""
+    """Run one MCP batch concurrently and isolate failures by action."""
     selected_actions = actions[: max(remaining_budget, 0)]
 
     async def run(action: Any) -> str:
@@ -135,6 +133,13 @@ async def _run_mcp_actions(
             return await mcp.call(
                 action.function.name, _arguments(action.function.arguments)
             )
+        except Exception:
+            logger.warning(
+                "MCP action failed tool=%s",
+                action.function.name,
+                exc_info=True,
+            )
+            return ""
         finally:
             logger.info(
                 "timing stage=mcp_tool tool=%s duration_sec=%.3f",
@@ -142,10 +147,7 @@ async def _run_mcp_actions(
                 time.perf_counter() - started,
             )
 
-    calls = [
-        run(action)
-        for action in selected_actions
-    ]
+    calls = [run(action) for action in selected_actions]
     if not calls:
         return []
     return list(await asyncio.gather(*calls))
@@ -214,20 +216,29 @@ class L2Harness:
             raise RuntimeError(f"L2 did not call required tool {name}")
         return _arguments(calls[0].function.arguments)
 
-    async def create_hypothetical_passage(self, query: str) -> str:
+    async def _assess_retrieval_query(self, query: str) -> RetrievalQueryDecision:
+        arguments = await self._forced_decision(
+            QUERY_ASSESSMENT_SYSTEM_PROMPT,
+            f"QUERY:\n{query}",
+            QUERY_ASSESSMENT_TOOL,
+        )
+        return RetrievalQueryDecision.model_validate(arguments)
+
+    async def create_retrieval_rationale(self, query: str) -> str:
         started = time.perf_counter()
         try:
             response = await self.client.chat.completions.create(
                 model=self.settings.model,
                 messages=[
-                    {"role": "system", "content": HYDE_SYSTEM_PROMPT},
+                    {"role": "system", "content": RETRIEVAL_RATIONALE_SYSTEM_PROMPT},
                     {"role": "user", "content": query},
                 ],
                 temperature=0.2,
             )
         finally:
             logger.info(
-                "timing stage=hyde duration_sec=%.3f", time.perf_counter() - started
+                "timing stage=retrieval_rationale duration_sec=%.3f",
+                time.perf_counter() - started,
             )
         return (response.choices[0].message.content or query).strip()
 
@@ -235,31 +246,19 @@ class L2Harness:
         self,
         tools: list[dict[str, Any]],
         query: str,
-        passage: str,
-        evidence: list[Evidence] | None = None,
-        observations: list[str] | None = None,
-        reflection: ReflectionDecision | None = None,
+        rationale: str = "",
     ) -> list[Any]:
-        if reflection is None:
-            system = TOOL_SELECTOR_SYSTEM_PROMPT
-            content = f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
+        content = f"QUERY:\n{query}"
+        if rationale:
+            content += f"\n\nRETRIEVAL RATIONALE:\n{rationale}"
         else:
-            system = REACT_ACTION_SYSTEM_PROMPT
-            recent = "\n\n".join((observations or [])[-3:])[-12000:]
-            content = (
-                f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
-                f"\n\nTOP REAL EVIDENCE:\n{_evidence_context(evidence or [])}"
-                f"\n\nRECENT TOOL OBSERVATIONS:\n{recent or 'None'}"
-                f"\n\nREFLECTION SUMMARY:\n{reflection.analysis_summary}"
-                f"\n\nNEXT QUERY:\n{reflection.next_query}"
-            )
-        stage = "initial_tool_selection" if reflection is None else "react_tool_selection"
+            content += "\n\nRETRIEVAL RATIONALE:\nNot required; use the query alone."
         started = time.perf_counter()
         try:
             response = await self.client.chat.completions.create(
                 model=self.settings.model,
                 messages=[
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": TOOL_SELECTOR_SYSTEM_PROMPT},
                     {"role": "user", "content": content},
                 ],
                 tools=tools,
@@ -268,33 +267,24 @@ class L2Harness:
             )
         finally:
             logger.info(
-                "timing stage=%s duration_sec=%.3f", stage, time.perf_counter() - started
+                "timing stage=tool_selection duration_sec=%.3f",
+                time.perf_counter() - started,
             )
         return response.choices[0].message.tool_calls or []
 
-    async def _reflect(
-        self, query: str, evidence: list[Evidence], round_number: int
-    ) -> ReflectionDecision:
-        content = (
-            f"QUERY:\n{query}\n\nROUND: {round_number}"
-            f"\n\nCURRENT REAL EVIDENCE:\n{_evidence_context(evidence)}"
-        )
-        arguments = await self._forced_decision(
-            REFLECTION_SYSTEM_PROMPT, content, REFLECTION_TOOL
-        )
-        return ReflectionDecision.model_validate(arguments)
-
     async def _finalize(
-        self, query: str, evidence: list[Evidence], sufficient: bool, note: str
+        self, query: str, evidence: list[Evidence], note: str
     ) -> RetrievalResult:
         if not evidence:
             return RetrievalResult(status="no_evidence", note=note)
         content = (
             f"Query: {query}\n\nCandidates:\n{_evidence_context(evidence)}\n\n"
-            f"Reflection sufficient={sufficient}. Call finalize_retrieval now."
+            "The single-pass retrieval is complete. Determine evidence sufficiency and call "
+            "finalize_retrieval now."
         )
         arguments = await self._forced_decision(
-            "Select final cite_uids only from supplied real evidence. Do not answer.",
+            "Select final cite_uids only from supplied real evidence, determine whether it is "
+            "sufficient, partial, or absent, and do not answer the medical query.",
             content,
             FINALIZE_TOOL,
         )
@@ -309,15 +299,12 @@ class L2Harness:
 
     async def retrieve(self, query: str) -> RetrievalResult:
         retrieval_started = time.perf_counter()
-        passage_task = asyncio.create_task(self.create_hypothetical_passage(query))
+        assessment_task = asyncio.create_task(self._assess_retrieval_query(query))
         documents: list[str] = []
         action_count = 0
         evidence: list[Evidence] = []
-        reflection = ReflectionDecision(
-            sufficient=False,
-            analysis_summary="Initial selection has not run.",
-            next_query=query,
-        )
+        decision: RetrievalQueryDecision | None = None
+        rationale = ""
         try:
             mcp_connect_started = time.perf_counter()
             async with self.mcp_factory(
@@ -330,45 +317,32 @@ class L2Harness:
                     time.perf_counter() - mcp_connect_started,
                 )
                 tools = await self._get_mcp_tools(mcp)
-                passage = await passage_task
+                decision = await assessment_task
+                if not decision.query_sufficient:
+                    rationale = await self.create_retrieval_rationale(query)
                 candidate_tools = rank_tool_candidates(
                     query,
                     tools,
                     self.settings.tool_candidate_limit,
-                    rationale=passage,
+                    rationale=rationale,
                 )
-                actions = await self._choose_actions(candidate_tools, query, passage)
-                for round_number in range(1, self.settings.max_reflection_rounds + 1):
-                    remaining_budget = self.settings.max_retrieval_calls - action_count
-                    outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
-                    documents.extend(outputs)
-                    action_count += len(outputs)
-                    evidence = rank_documents(
-                        query,
-                        passage,
-                        documents,
-                    )
-                    reflection = await self._reflect(query, evidence, round_number)
-                    if (
-                        reflection.sufficient
-                        or action_count >= self.settings.max_retrieval_calls
-                    ):
-                        break
-                    actions = await self._choose_actions(
-                        candidate_tools,
-                        query,
-                        passage,
-                        evidence=evidence,
-                        observations=documents,
-                        reflection=reflection,
-                    )
+                actions = await self._choose_actions(candidate_tools, query, rationale)
+                outputs = await _run_mcp_actions(
+                    mcp, actions, self.settings.max_retrieval_calls
+                )
+                documents.extend(outputs)
+                action_count = len(outputs)
+                evidence = rank_documents(query, rationale, documents)
         finally:
-            if not passage_task.done():
-                passage_task.cancel()
-            await asyncio.gather(passage_task, return_exceptions=True)
-        result = await self._finalize(
-            query, evidence, reflection.sufficient, reflection.analysis_summary
-        )
+            if not assessment_task.done():
+                assessment_task.cancel()
+            await asyncio.gather(assessment_task, return_exceptions=True)
+
+        strategy = "query-only" if decision and decision.query_sufficient else "query+rationale"
+        note = f"Single-pass {strategy} retrieval."
+        if decision and decision.reason:
+            note += f" Query assessment: {decision.reason}"
+        result = await self._finalize(query, evidence, note)
         result.tool_calls = action_count
         logger.info(
             "timing stage=retrieval_total tool_calls=%d duration_sec=%.3f",

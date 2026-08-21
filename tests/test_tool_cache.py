@@ -29,11 +29,11 @@ def _call(name: str, arguments: str) -> Mock:
     return call
 
 
-def _response(calls: list[Any]) -> SimpleNamespace:
+def _response(calls: list[Any], content: str = "") -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content="", tool_calls=calls)
+                message=SimpleNamespace(content=content, tool_calls=calls)
             )
         ]
     )
@@ -71,14 +71,14 @@ def test_tool_schemas_are_cached_across_concurrent_requests() -> None:
 
 class CoordinatedMCP:
     def __init__(
-        self, hyde_started: asyncio.Event, connection_started: asyncio.Event
+        self, assessment_started: asyncio.Event, connection_started: asyncio.Event
     ) -> None:
-        self.hyde_started = hyde_started
+        self.assessment_started = assessment_started
         self.connection_started = connection_started
 
     async def __aenter__(self) -> Self:
         self.connection_started.set()
-        await asyncio.wait_for(self.hyde_started.wait(), timeout=0.5)
+        await asyncio.wait_for(self.assessment_started.wait(), timeout=0.5)
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -91,24 +91,30 @@ class CoordinatedMCP:
         return '{"cite_uid":"cite-test","content":"grounded evidence"}'
 
 
-def test_hyde_and_mcp_connection_start_concurrently() -> None:
+def test_query_assessment_and_mcp_connection_start_concurrently() -> None:
     async def run() -> None:
-        hyde_started = asyncio.Event()
+        assessment_started = asyncio.Event()
         connection_started = asyncio.Event()
-        fake_mcp = CoordinatedMCP(hyde_started, connection_started)
-        create = AsyncMock(
-            side_effect=[
-                _response([_call("test_tool", '{"query":"test"}')]),
-                _response(
+        fake_mcp = CoordinatedMCP(assessment_started, connection_started)
+
+        async def create_response(**kwargs: Any) -> SimpleNamespace:
+            tools = kwargs.get("tools") or []
+            tool_names = [tool["function"]["name"] for tool in tools]
+            if "submit_query_assessment" in tool_names:
+                assessment_started.set()
+                await asyncio.wait_for(connection_started.wait(), timeout=0.5)
+                return _response(
                     [
                         _call(
-                            "submit_reflection",
-                            '{"sufficient":true,"analysis_summary":"enough",'
-                            '"next_query":""}',
+                            "submit_query_assessment",
+                            '{"query_sufficient":true,"reason":"specific query"}',
                         )
                     ]
-                ),
-                _response(
+                )
+            if tool_names == ["test_tool"]:
+                return _response([_call("test_tool", '{"query":"test"}')])
+            if "finalize_retrieval" in tool_names:
+                return _response(
                     [
                         _call(
                             "finalize_retrieval",
@@ -117,9 +123,71 @@ def test_hyde_and_mcp_connection_start_concurrently() -> None:
                             '"note":""}',
                         )
                     ]
-                ),
-            ]
+                )
+            raise AssertionError(
+                f"query-sufficient retrieval made an unexpected L2 call: {tool_names}"
+            )
+
+        create = AsyncMock(side_effect=create_response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
+        harness = L2Harness(
+            settings=Settings(LUNIT_FM_API_KEY="lunit_test"),
+            client=client,  # type: ignore[arg-type]
+            mcp_factory=lambda *_: fake_mcp,  # type: ignore[arg-type]
+        )
+        result = await asyncio.wait_for(harness.retrieve("test query"), timeout=1)
+
+        assert result.status == "sufficient"
+        assert result.evidence[0].cite_uid == "cite-test"
+        assert assessment_started.is_set()
+        assert connection_started.is_set()
+
+    asyncio.run(run())
+
+
+def test_query_assessment_generates_rationale_only_when_needed() -> None:
+    async def run() -> None:
+        assessment_started = asyncio.Event()
+        connection_started = asyncio.Event()
+        fake_mcp = CoordinatedMCP(assessment_started, connection_started)
+        rationale = "official label interaction evidence and monitoring requirements"
+        selector_contents: list[str] = []
+
+        async def create_response(**kwargs: Any) -> SimpleNamespace:
+            tools = kwargs.get("tools") or []
+            tool_names = [tool["function"]["name"] for tool in tools]
+            if "submit_query_assessment" in tool_names:
+                assessment_started.set()
+                await asyncio.wait_for(connection_started.wait(), timeout=0.5)
+                return _response(
+                    [
+                        _call(
+                            "submit_query_assessment",
+                            '{"query_sufficient":false,"reason":"expansion needed"}',
+                        )
+                    ]
+                )
+            if not tools:
+                return _response([], content=rationale)
+            if tool_names == ["test_tool"]:
+                selector_contents.append(kwargs["messages"][-1]["content"])
+                return _response([_call("test_tool", '{"query":"test"}')])
+            if "finalize_retrieval" in tool_names:
+                return _response(
+                    [
+                        _call(
+                            "finalize_retrieval",
+                            '{"status":"sufficient","items":['
+                            '{"cite_uid":"cite-test","relevance_score":0.9}],'
+                            '"note":""}',
+                        )
+                    ]
+                )
+            raise AssertionError(f"unexpected L2 call: {tool_names}")
+
+        create = AsyncMock(side_effect=create_response)
         client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
@@ -129,15 +197,10 @@ def test_hyde_and_mcp_connection_start_concurrently() -> None:
             mcp_factory=lambda *_: fake_mcp,  # type: ignore[arg-type]
         )
 
-        async def coordinated_hyde(query: str) -> str:
-            hyde_started.set()
-            await asyncio.wait_for(connection_started.wait(), timeout=0.5)
-            return "grounded evidence"
-
-        harness.create_hypothetical_passage = coordinated_hyde  # type: ignore[method-assign]
-        result = await asyncio.wait_for(harness.retrieve("test query"), timeout=1)
+        result = await asyncio.wait_for(harness.retrieve("ambiguous query"), timeout=1)
 
         assert result.status == "sufficient"
-        assert result.evidence[0].cite_uid == "cite-test"
+        assert selector_contents and rationale in selector_contents[0]
+        assert any(not call.kwargs.get("tools") for call in create.await_args_list)
 
     asyncio.run(run())
