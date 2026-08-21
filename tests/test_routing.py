@@ -14,6 +14,8 @@ from l2_baseline.harness import (
     _compact_messages,
     _deterministic_guideline_request,
     _deterministic_structured_request,
+    _ensure_required_follow_up,
+    _follow_up_requirement,
     _guideline_focus_queries,
     _has_explicit_retrieval_intent,
     _index_page_argument_candidates,
@@ -576,6 +578,86 @@ def test_direct_route_uses_one_l2_call() -> None:
     assert "tools" not in request
     assert "tool_choice" not in request
     assert mcp.calls == []
+
+
+def test_uncertain_diagnosis_prompt_requires_an_answer_and_useful_context() -> None:
+    harness, create, mcp = _harness([_response(content="careful working diagnosis")])
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "My knee clicks when I climb stairs. Give me one definite cause."
+                    ),
+                }
+            ]
+        )
+    )
+
+    assert answer.startswith("careful working diagnosis")
+    assert "when did it start" in answer
+    assert answer.endswith("?")
+    system_prompt = create.await_args.kwargs["messages"][0]["content"]
+    assert "single most likely working explanation" in system_prompt
+    assert "one or two concrete, highest-yield questions" in system_prompt
+    assert "do not merely refuse" in system_prompt
+    assert "tools" not in create.await_args.kwargs
+    assert mcp.calls == []
+
+
+def test_existing_explicit_follow_up_is_not_duplicated() -> None:
+    answer = "This is most likely mechanical. Is there swelling or locking?"
+
+    result = _ensure_required_follow_up(
+        answer,
+        "diagnostic_uncertainty",
+        "Give me one definite cause for my knee clicking.",
+    )
+
+    assert result == answer
+
+
+def test_child_medication_with_missing_weight_requires_safety_question() -> None:
+    messages = [
+        {"role": "user", "content": "Can I give my child medicine for a fever?"},
+        {
+            "role": "user",
+            "content": "I don't know his weight and only have adult acetaminophen pills.",
+        },
+    ]
+
+    requirement = _follow_up_requirement(messages)
+    answer = _ensure_required_follow_up(
+        "Do not give an uncalculated adult dose.",
+        requirement,
+        messages[-1]["content"],
+    )
+
+    assert requirement == "pediatric_medication"
+    assert "exact age and current weight" in answer
+    assert "active ingredient and strength" in answer
+    assert answer.endswith("?")
+
+
+def test_earlier_request_for_questions_is_preserved_across_turns() -> None:
+    messages = [
+        {"role": "user", "content": "Please ask me questions about my joint pains."},
+        {"role": "assistant", "content": "Which joints hurt?"},
+        {"role": "user", "content": "It feels random and I am not sure."},
+    ]
+
+    assert _follow_up_requirement(messages) == "requested_questions"
+
+
+def test_immediate_emergency_does_not_delay_action_with_forced_question() -> None:
+    messages = [
+        {"role": "user", "content": "Ask questions if needed."},
+        {"role": "user", "content": "My child is unresponsive and not breathing."},
+    ]
+
+    assert _follow_up_requirement(messages) is None
 
 
 def test_general_question_rejects_spurious_retrieval_request() -> None:
