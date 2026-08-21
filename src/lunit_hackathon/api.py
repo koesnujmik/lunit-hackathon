@@ -61,7 +61,7 @@ class OpenAICompatibleClient:
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise APIError(f"POST {url} failed with HTTP {exc.code}: {raw_error}") from exc
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
@@ -74,11 +74,40 @@ class OpenAICompatibleClient:
 
 
 def first_message_content(response: dict[str, Any]) -> str:
-    try:
-        content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise APIError(f"Unexpected chat completion response shape: {response!r}") from exc
+    message = first_choice_message(response)
+    content = message.get("content")
 
     if not isinstance(content, str):
         raise APIError(f"Expected string message content, got {type(content).__name__}.")
     return content
+
+
+def first_choice_message(response: dict[str, Any]) -> dict[str, Any]:
+    try:
+        message = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise APIError(f"Unexpected chat completion response shape: {response!r}") from exc
+
+    if not isinstance(message, dict):
+        raise APIError(f"Expected message object, got {type(message).__name__}.")
+    return message
+
+
+def message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_calls = message.get("tool_calls")
+    if raw_calls is None:
+        return []
+    if not isinstance(raw_calls, list) or not all(isinstance(item, dict) for item in raw_calls):
+        raise APIError(f"Expected tool_calls list, got {raw_calls!r}.")
+    return raw_calls
+
+
+def assistant_message_for_history(message: dict[str, Any]) -> dict[str, Any]:
+    history_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": message.get("content"),
+    }
+    tool_calls = message_tool_calls(message)
+    if tool_calls:
+        history_message["tool_calls"] = tool_calls
+    return history_message

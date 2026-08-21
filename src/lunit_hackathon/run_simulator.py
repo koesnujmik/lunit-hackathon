@@ -32,7 +32,7 @@ def append_jsonl(path: Path, item: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a basic Patient Simulator conversation.")
+    parser = argparse.ArgumentParser(description="Run the two-phase harness with Patient Simulator.")
     parser.add_argument("--turns", type=int, default=3, help="Number of user/assistant turns to run.")
     parser.add_argument("--log-dir", default="logs", help="Directory for JSONL conversation logs.")
     args = parser.parse_args()

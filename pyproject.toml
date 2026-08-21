@@ -1,7 +1,7 @@
 [project]
 name = "lunit-hackathon"
-version = "0.1.0"
-description = "Basic Lunit Hackathon HealthBench harness"
+version = "0.2.0"
+description = "Two-phase Lunit L2 harness for the HealthBench track"
 requires-python = ">=3.11"
 dependencies = []
 
