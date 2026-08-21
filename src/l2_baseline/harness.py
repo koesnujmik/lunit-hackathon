@@ -18,6 +18,16 @@ from .prompts import (
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
 from .ranking import rank_documents, rank_tool_candidates
+from .workflows import (
+    MCPAction,
+    RetrievalWorkflowState,
+    action_name_arguments,
+    automatic_next_actions,
+    has_pending_workflow,
+    initial_tool_frontier,
+    next_tool_frontier,
+    prepare_model_actions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,15 +140,14 @@ async def _run_mcp_actions(
     selected_actions = actions[: max(remaining_budget, 0)]
 
     async def run(action: Any) -> str:
+        tool_name, arguments = action_name_arguments(action)
         started = time.perf_counter()
         try:
-            return await mcp.call(
-                action.function.name, _arguments(action.function.arguments)
-            )
+            return await mcp.call(tool_name, arguments)
         finally:
             logger.info(
                 "timing stage=mcp_tool tool=%s duration_sec=%.3f",
-                action.function.name,
+                tool_name,
                 time.perf_counter() - started,
             )
 
@@ -219,6 +228,7 @@ class L2Harness:
         evidence: list[Evidence] | None = None,
         observations: list[str] | None = None,
         reflection: ReflectionDecision | None = None,
+        workflow_state: str = "",
     ) -> list[Any]:
         if reflection is None:
             system = TOOL_SELECTOR_SYSTEM_PROMPT
@@ -232,6 +242,7 @@ class L2Harness:
                 f"\n\nRECENT TOOL OBSERVATIONS:\n{recent or 'None'}"
                 f"\n\nREFLECTION SUMMARY:\n{reflection.analysis_summary}"
                 f"\n\nNEXT QUERY:\n{reflection.next_query}"
+                f"\n\nWORKFLOW STATE:\n{workflow_state or 'None'}"
             )
         stage = "initial_tool_selection" if reflection is None else "react_tool_selection"
         started = time.perf_counter()
@@ -293,6 +304,7 @@ class L2Harness:
         documents: list[str] = []
         action_count = 0
         evidence: list[Evidence] = []
+        workflow_state = RetrievalWorkflowState(query=query)
         reflection = ReflectionDecision(
             sufficient=False,
             analysis_summary="Initial selection has not run.",
@@ -317,24 +329,75 @@ class L2Harness:
             candidate_tools = rank_tool_candidates(
                 f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
             )
-            actions = await self._choose_actions(candidate_tools, query, passage)
+            initial_frontier = initial_tool_frontier(tools, candidate_tools)
+            selected_actions = await self._choose_actions(initial_frontier, query, passage)
+            actions: list[MCPAction] = prepare_model_actions(
+                selected_actions, tools, workflow_state
+            )
             for round_number in range(1, self.settings.max_reflection_rounds + 1):
                 remaining_budget = self.settings.max_retrieval_calls - action_count
-                outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
+                executed_actions = actions[: max(remaining_budget, 0)]
+                outputs = await _run_mcp_actions(mcp, executed_actions, remaining_budget)
+                for action, output in zip(executed_actions, outputs, strict=True):
+                    workflow_state.observe(action, output)
                 documents.extend(outputs)
                 action_count += len(outputs)
                 evidence = rank_documents(passage, documents, self.settings.retrieval_top_k)
+
+                can_continue = (
+                    action_count < self.settings.max_retrieval_calls
+                    and round_number < self.settings.max_reflection_rounds
+                )
+                if can_continue and has_pending_workflow(workflow_state):
+                    automatic_actions = automatic_next_actions(tools, workflow_state)
+                    if automatic_actions:
+                        logger.info(
+                            "workflow auto_advance actions=%s state=%s",
+                            [action.tool_name for action in automatic_actions],
+                            workflow_state.workflow_context(),
+                        )
+                        actions = automatic_actions
+                        continue
+
+                    frontier = next_tool_frontier(tools, candidate_tools, workflow_state)
+                    dependency_decision = ReflectionDecision(
+                        sufficient=False,
+                        analysis_summary=(
+                            "Complete the active tool workflow using the available state values."
+                        ),
+                        next_query=query,
+                    )
+                    selected_actions = await self._choose_actions(
+                        frontier,
+                        query,
+                        passage,
+                        evidence=evidence,
+                        observations=documents,
+                        reflection=dependency_decision,
+                        workflow_state=workflow_state.workflow_context(),
+                    )
+                    actions = prepare_model_actions(
+                        selected_actions, tools, workflow_state
+                    )
+                    if actions:
+                        continue
+
                 reflection = await self._reflect(query, evidence, round_number)
                 if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
                     break
-                actions = await self._choose_actions(
-                    candidate_tools,
+                frontier = next_tool_frontier(tools, candidate_tools, workflow_state)
+                selected_actions = await self._choose_actions(
+                    frontier,
                     query,
                     passage,
                     evidence=evidence,
                     observations=documents,
                     reflection=reflection,
+                    workflow_state=workflow_state.workflow_context(),
                 )
+                actions = prepare_model_actions(selected_actions, tools, workflow_state)
+                if not actions:
+                    break
         result = await self._finalize(
             query, evidence, reflection.sufficient, reflection.analysis_summary
         )
