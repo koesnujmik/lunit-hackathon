@@ -8,7 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
+COPY submission_api_key ./submission_api_key
 COPY src ./src
+RUN test -s /app/submission_api_key
 RUN pip install --no-cache-dir .
 
 RUN useradd --create-home --uid 10001 appuser

@@ -8,13 +8,24 @@ from .config import Settings
 from .mcp_client import LunitMCPClient
 from .models import CitationSelection, Evidence, ReflectionDecision, RetrievalResult
 from .prompts import (
-    GENERATION_SYSTEM_PROMPT,
     HYDE_SYSTEM_PROMPT,
     REACT_ACTION_SYSTEM_PROMPT,
     REFLECTION_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
 from .ranking import rank_documents, rank_tool_candidates
+
+DIRECT_SYSTEM_PROMPT = """You are a careful medical assistant powered by Lunit L2.
+Answer the user's latest question directly using the supplied conversation context.
+
+Rules:
+- Respond in the same language as the user's latest message.
+- Answer the question first, then include useful reasoning and next steps.
+- Put emergency actions first when dangerous symptoms are present.
+- Explain important uncertainty and do not claim a definite diagnosis without enough evidence.
+- Be dense and specific rather than padded or repetitive.
+- Do not invent citations or claim that you searched external sources.
+"""
 
 
 def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -130,7 +141,7 @@ class L2Harness:
             api_key=self.settings.token,
             base_url=self.settings.api_url.rstrip("/") + "/v1",
             timeout=self.settings.request_timeout_sec,
-            max_retries=2,
+            max_retries=0,
         )
         self.mcp_factory = mcp_factory
 
@@ -276,47 +287,23 @@ class L2Harness:
     async def chat(self, messages: list[dict[str, str]]) -> str:
         if not messages or messages[-1].get("role") != "user":
             raise ValueError("messages must end with a user message")
-        generation_prompt = (
-            GENERATION_SYSTEM_PROMPT
-            + "\n"
-            + _response_language_instruction(messages[-1]["content"])
-        )
-        generation_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": generation_prompt}, *messages
+        compact_messages = [
+            {
+                "role": message["role"],
+                "content": message["content"][: self.settings.max_message_chars],
+            }
+            for message in messages[-self.settings.max_history_messages :]
         ]
+        generation_prompt = DIRECT_SYSTEM_PROMPT + "\n" + _response_language_instruction(
+            messages[-1]["content"]
+        )
         response = await self.client.chat.completions.create(
             model=self.settings.model,
-            messages=generation_messages,
-            tools=[RETRIEVE_TOOL],
-            tool_choice="auto",
-            temperature=0.2,
+            messages=[{"role": "system", "content": generation_prompt}, *compact_messages],
+            temperature=0,
+            max_tokens=self.settings.generation_max_tokens,
         )
-        message = response.choices[0].message
-        calls = message.tool_calls or []
-        if not calls:
-            return message.content or ""
-        retrieve_calls = [
-            call for call in calls if call.function.name == "retrieve_relevant_content"
-        ]
-        if not retrieve_calls:
-            raise RuntimeError("Generation returned an unsupported tool call")
-
-        selected_call = retrieve_calls[0]
-        query = _arguments(selected_call.function.arguments)["query"]
-        result = await self.retrieve(query)
-        generation_messages.append(_assistant_message(message))
-        for call in calls:
-            content = (
-                result.for_generation()
-                if call.id == selected_call.id
-                else "Only one retrieval call is allowed per answer."
-            )
-            generation_messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": content}
-            )
-        final_response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=generation_messages,
-            temperature=0.2,
-        )
-        return final_response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if not content.strip():
+            raise RuntimeError("L2 returned an empty direct answer")
+        return content

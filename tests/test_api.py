@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ from l2_baseline import api
 class FakeHarness:
     def __init__(self) -> None:
         self.messages: list[dict[str, str]] = []
+        self.settings = SimpleNamespace(turn_timeout_sec=1)
 
     async def chat(self, messages: list[dict[str, str]]) -> str:
         self.messages = messages
@@ -21,6 +23,12 @@ def test_models_endpoint() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/json; charset=utf-8"
     assert response.json()["data"][0]["id"] == "Lunit/L2-preview"
+
+
+def test_health_identifies_direct_only_mode() -> None:
+    response = TestClient(api.app).get("/health")
+    assert response.status_code == 200
+    assert response.json()["mode"] == "trial-direct-only"
 
 
 def test_chat_completions_preserves_full_history(monkeypatch: object) -> None:
@@ -45,7 +53,8 @@ def test_chat_completions_preserves_full_history(monkeypatch: object) -> None:
     assert harness.messages == request["messages"]
 
 
-def test_streaming_is_rejected() -> None:
+def test_streaming_is_openai_compatible(monkeypatch: object) -> None:
+    monkeypatch.setattr(api, "_harness", FakeHarness())  # type: ignore[attr-defined]
     response = TestClient(api.app).post(
         "/v1/chat/completions",
         json={
@@ -54,7 +63,10 @@ def test_streaming_is_rejected() -> None:
             "stream": True,
         },
     )
-    assert response.status_code == 400
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"content": "테스트 답변"' in response.text
+    assert response.text.endswith("data: [DONE]\n\n")
 
 
 def test_upstream_failure_is_reported_as_bad_gateway(monkeypatch: object) -> None:
@@ -75,3 +87,19 @@ def test_upstream_failure_is_reported_as_bad_gateway(monkeypatch: object) -> Non
         },
     )
     assert response.status_code == 502
+
+
+def test_turn_timeout_is_bounded(monkeypatch: object) -> None:
+    harness = FakeHarness()
+    harness.chat = AsyncMock(side_effect=TimeoutError())
+    monkeypatch.setattr(api, "_harness", harness)  # type: ignore[attr-defined]
+
+    response = TestClient(api.app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "Lunit/L2-preview",
+            "messages": [{"role": "user", "content": "question"}],
+        },
+    )
+
+    assert response.status_code == 504
