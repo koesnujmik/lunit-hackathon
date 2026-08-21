@@ -49,11 +49,13 @@ def rank_tool_candidates(
     return [item[2] for item in scored[:limit]]
 
 
-def rank_documents(passage: str, documents: list[str], top_k: int = 3) -> list[Evidence]:
-    """Rank MCP result documents against the HyDE passage with TF-IDF cosine similarity."""
+def rank_documents(
+    retrieval_rationale: str, documents: list[str], top_k: int = 3
+) -> list[Evidence]:
+    """Rank MCP results against the retrieval rationale with TF-IDF cosine similarity."""
     if not documents:
         return []
-    tokenized = [_tokens(passage), *(_tokens(document) for document in documents)]
+    tokenized = [_tokens(retrieval_rationale), *(_tokens(document) for document in documents)]
     document_frequency = Counter(token for tokens in tokenized for token in set(tokens))
     total = len(tokenized)
     idf = {

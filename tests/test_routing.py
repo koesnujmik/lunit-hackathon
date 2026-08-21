@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 from l2_baseline.config import Settings
 from l2_baseline.harness import L2Harness, _response_language_instruction
 from l2_baseline.models import RetrievalResult
+from l2_baseline.prompts import RETRIEVAL_RATIONALE_SYSTEM_PROMPT
 
 
 def _harness(responses: list[object]) -> tuple[L2Harness, AsyncMock]:
@@ -79,6 +80,23 @@ def test_tool_selection_allows_model_to_choose_whether_to_call() -> None:
 
     assert actions == []
     assert create.await_args.kwargs["tool_choice"] == "auto"
+
+
+def test_retrieval_rationale_describes_needed_evidence_without_answering() -> None:
+    message = SimpleNamespace(
+        content="Need the population, outcome, exact threshold, and official guideline source.",
+        tool_calls=None,
+    )
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    harness, create = _harness([response])
+
+    rationale = asyncio.run(harness.create_retrieval_rationale("What is the target?"))
+
+    assert "official guideline source" in rationale
+    system_prompt = create.await_args.kwargs["messages"][0]["content"]
+    assert system_prompt == RETRIEVAL_RATIONALE_SYSTEM_PROMPT
+    assert "Do not answer the query" in system_prompt
+    assert "under 140 words" in system_prompt
 
 
 def test_structured_decision_uses_auto_tool_choice() -> None:

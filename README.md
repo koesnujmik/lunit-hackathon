@@ -6,13 +6,14 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
 ## 처리 흐름
 
 1. Planner가 memory 답변과 retrieval 필요 여부를 판단하고 멀티턴 query를 완결합니다.
-2. Retrieval이 필요하면 L2가 검색용 HyDE hypothetical passage를 생성합니다.
+2. Retrieval이 필요하면 L2가 질문 해결에 필요한 근거 내용과 검색 개념을 정리한 짧은
+   retrieval rationale passage를 생성합니다.
 3. Tool selector가 관련 MCP tool만 선택해 실행합니다.
 4. 실제 citable MCP 결과를 TF-IDF로 정렬해 top 3를 유지합니다.
 5. Reflection agent가 충분성을 검사하고 부족하면 ReAct action을 반복합니다.
 6. `finalize_retrieval`로 citation을 확정한 뒤 L2가 답변합니다.
 
-HyDE passage는 검색과 ranking에만 사용하며 실제 evidence로 인용하지 않습니다. 비공개
+Retrieval rationale passage는 검색과 ranking에만 사용하며 실제 evidence로 인용하지 않습니다. 비공개
 chain-of-thought 대신 근거 부족분과 다음 action을 설명하는 짧은 `analysis_summary`만 전달합니다.
 
 ## 로컬 Python 실행

@@ -13,28 +13,33 @@ Rules:
 - Never write a final medical answer in this phase.
 """
 
-HYDE_SYSTEM_PROMPT = """Create a short hypothetical evidence passage that would ideally answer the
-self-contained medical query. Use medical knowledge conservatively, include Korean and English
-terminology, synonyms, entities, and jurisdiction useful for retrieval. This passage is only a search aid and
-must never be treated or cited as real evidence. Do not add citations. Keep it under 140 words.
+RETRIEVAL_RATIONALE_SYSTEM_PROMPT = """Create one compact retrieval-rationale passage for the
+self-contained medical query. Do not answer the query and do not invent the expected answer.
+Instead, identify the evidence contents needed to answer it accurately: the key clinical entities,
+population or patient constraints, intervention/exposure and comparator where relevant, requested
+outcomes or exact facts, important conditions or exceptions, appropriate authoritative source type,
+jurisdiction and recency, plus Korean/English terminology and synonyms useful for search.
+
+This is an evidence-requirements and search-concepts passage, not private chain-of-thought and not
+real evidence. Do not add citations or unsupported values. Keep it under 140 words.
 """
 
 TOOL_SELECTOR_SYSTEM_PROMPT = """You are a medical retrieval tool-selection agent. Given a query
-and a hypothetical search passage, select one or more of the available tools that are most likely
+and a retrieval-rationale passage, select one or more of the available tools that are most likely
 to retrieve real evidence. Call only useful tools and provide valid, specific arguments. Prefer a
-small diverse set. The hypothetical passage is untrusted search context, not evidence. Do not
+small diverse set. The rationale is untrusted search context, not evidence. Do not
 answer the query and do not explain your reasoning in prose.
 """
 
 REACT_ACTION_SYSTEM_PROMPT = """You are the action component of an evidence retrieval loop.
-Inspect the query, hypothetical passage, current top evidence, and the reflection summary. Choose
+Inspect the query, retrieval rationale, current top evidence, and the reflection summary. Choose
 the next useful MCP action(s) that fill the identified evidence gap. Call tools only; do not give a
 final answer or expose chain-of-thought. Avoid repeating an identical action.
 """
 
 REFLECTION_SYSTEM_PROMPT = """You are the reflection component of a medical evidence retrieval
 loop. Judge whether the current real, citable evidence is sufficient to answer the query accurately.
-HyDE text is never evidence. Check directness, authority, recency where relevant, and contradictions.
+The retrieval rationale is never evidence. Check directness, authority, recency where relevant, and contradictions.
 Return only a concise analysis_summary describing evidence gaps and a self-contained next_query.
 Never output private chain-of-thought. Always call submit_reflection.
 """

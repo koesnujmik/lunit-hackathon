@@ -12,9 +12,9 @@ from .mcp_client import LunitMCPClient
 from .models import CitationSelection, Evidence, ReflectionDecision, RetrievalResult
 from .prompts import (
     GENERATION_SYSTEM_PROMPT,
-    HYDE_SYSTEM_PROMPT,
     REACT_ACTION_SYSTEM_PROMPT,
     REFLECTION_SYSTEM_PROMPT,
+    RETRIEVAL_RATIONALE_SYSTEM_PROMPT,
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
 from .ranking import rank_documents, rank_tool_candidates
@@ -194,20 +194,21 @@ class L2Harness:
             raise RuntimeError(f"L2 did not call required tool {name}")
         return _arguments(calls[0].function.arguments)
 
-    async def create_hypothetical_passage(self, query: str) -> str:
+    async def create_retrieval_rationale(self, query: str) -> str:
         started = time.perf_counter()
         try:
             response = await self.client.chat.completions.create(
                 model=self.settings.model,
                 messages=[
-                    {"role": "system", "content": HYDE_SYSTEM_PROMPT},
+                    {"role": "system", "content": RETRIEVAL_RATIONALE_SYSTEM_PROMPT},
                     {"role": "user", "content": query},
                 ],
                 temperature=0.2,
             )
         finally:
             logger.info(
-                "timing stage=hyde duration_sec=%.3f", time.perf_counter() - started
+                "timing stage=retrieval_rationale duration_sec=%.3f",
+                time.perf_counter() - started,
             )
         return (response.choices[0].message.content or query).strip()
 
@@ -215,19 +216,19 @@ class L2Harness:
         self,
         tools: list[dict[str, Any]],
         query: str,
-        passage: str,
+        rationale: str,
         evidence: list[Evidence] | None = None,
         observations: list[str] | None = None,
         reflection: ReflectionDecision | None = None,
     ) -> list[Any]:
         if reflection is None:
             system = TOOL_SELECTOR_SYSTEM_PROMPT
-            content = f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
+            content = f"QUERY:\n{query}\n\nRETRIEVAL RATIONALE:\n{rationale}"
         else:
             system = REACT_ACTION_SYSTEM_PROMPT
             recent = "\n\n".join((observations or [])[-3:])[-12000:]
             content = (
-                f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
+                f"QUERY:\n{query}\n\nRETRIEVAL RATIONALE:\n{rationale}"
                 f"\n\nTOP REAL EVIDENCE:\n{_evidence_context(evidence or [])}"
                 f"\n\nRECENT TOOL OBSERVATIONS:\n{recent or 'None'}"
                 f"\n\nREFLECTION SUMMARY:\n{reflection.analysis_summary}"
@@ -289,7 +290,7 @@ class L2Harness:
 
     async def retrieve(self, query: str) -> RetrievalResult:
         retrieval_started = time.perf_counter()
-        passage = await self.create_hypothetical_passage(query)
+        rationale = await self.create_retrieval_rationale(query)
         documents: list[str] = []
         action_count = 0
         evidence: list[Evidence] = []
@@ -315,22 +316,22 @@ class L2Harness:
                     time.perf_counter() - tool_list_started,
                 )
             candidate_tools = rank_tool_candidates(
-                f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
+                f"{query}\n{rationale}", tools, self.settings.tool_candidate_limit
             )
-            actions = await self._choose_actions(candidate_tools, query, passage)
+            actions = await self._choose_actions(candidate_tools, query, rationale)
             for round_number in range(1, self.settings.max_reflection_rounds + 1):
                 remaining_budget = self.settings.max_retrieval_calls - action_count
                 outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
                 documents.extend(outputs)
                 action_count += len(outputs)
-                evidence = rank_documents(passage, documents, self.settings.retrieval_top_k)
+                evidence = rank_documents(rationale, documents, self.settings.retrieval_top_k)
                 reflection = await self._reflect(query, evidence, round_number)
                 if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
                     break
                 actions = await self._choose_actions(
                     candidate_tools,
                     query,
-                    passage,
+                    rationale,
                     evidence=evidence,
                     observations=documents,
                     reflection=reflection,

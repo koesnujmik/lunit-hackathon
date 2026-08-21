@@ -18,7 +18,7 @@ async def inspect_candidates(
     test_auto_selector: bool = False,
 ) -> None:
     harness = L2Harness()
-    passage = await harness.create_hypothetical_passage(query)
+    rationale = await harness.create_retrieval_rationale(query)
     async with LunitMCPClient(
         harness.settings.mcp_url,
         harness.settings.token,
@@ -26,9 +26,9 @@ async def inspect_candidates(
     ) as mcp:
         tools = await mcp.openai_tools()
     candidates = rank_tool_candidates(
-        f"{query}\n{passage}", tools, harness.settings.tool_candidate_limit
+        f"{query}\n{rationale}", tools, harness.settings.tool_candidate_limit
     )
-    print(f"HYDE_WORDS={len(passage.split())}")
+    print(f"RATIONALE_WORDS={len(rationale.split())}")
     for tool in candidates:
         print(
             "CANDIDATE",
@@ -53,7 +53,7 @@ async def inspect_candidates(
                 started = time.perf_counter()
                 try:
                     actions = await test_harness._choose_actions(
-                        [daily_med_tool], query, passage
+                        [daily_med_tool], query, rationale
                     )
                 finally:
                     print(
@@ -69,7 +69,7 @@ async def inspect_candidates(
                         {"role": "system", "content": TOOL_SELECTOR_SYSTEM_PROMPT},
                         {
                             "role": "user",
-                            "content": f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}",
+                            "content": f"QUERY:\n{query}\n\nRETRIEVAL RATIONALE:\n{rationale}",
                         },
                     ],
                     tools=[daily_med_tool],
