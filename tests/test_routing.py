@@ -118,6 +118,52 @@ def test_router_only_retrieves_source_specific_requests() -> None:
     )
 
 
+def test_router_uses_latest_turn_for_unrelated_followup() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": "According to current clinical guidelines, what is the BP target?",
+        },
+        {"role": "assistant", "content": "The guideline recommends a target."},
+        {"role": "user", "content": "What kind of exercise would be practical for me?"},
+    ]
+
+    assert not _needs_retrieval(messages)
+
+
+def test_router_keeps_retrieval_for_source_referential_followup() -> None:
+    english_messages = [
+        {"role": "user", "content": "What do current clinical guidelines recommend?"},
+        {"role": "assistant", "content": "The guideline recommends treatment."},
+        {
+            "role": "user",
+            "content": "Does that recommendation apply to older adults?",
+        },
+    ]
+    korean_messages = [
+        {"role": "user", "content": "심평원 급여 기준을 알려줘"},
+        {"role": "assistant", "content": "현재 급여 기준은 다음과 같습니다."},
+        {"role": "user", "content": "그 기준에 예외도 있어?"},
+    ]
+
+    assert _needs_retrieval(english_messages)
+    assert _needs_retrieval(korean_messages)
+
+
+def test_router_does_not_treat_causal_source_as_citation_request() -> None:
+    assert not _needs_retrieval(
+        [{"role": "user", "content": "What could be the source of this shoulder pain?"}]
+    )
+    assert not _needs_retrieval(
+        [
+            {
+                "role": "user",
+                "content": "According to my doctor, this may be muscular. What do you think?",
+            }
+        ]
+    )
+
+
 def test_compaction_preserves_first_user_request_and_recent_turns() -> None:
     messages = [
         {"role": "user" if index % 2 == 0 else "assistant", "content": f"message-{index}"}

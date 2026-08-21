@@ -15,13 +15,27 @@ from .ranking import rank_documents, rank_tool_candidates
 
 SOURCE_SPECIFIC_PATTERN = re.compile(
     r"(?:"
-    r"\b(?:according to|clinical guidelines?|consensus statement|hira|"
+    r"\b(?:guidelines?|guideline recommendations?|consensus statement|hira|"
     r"reimburs\w*|coverage criteria|mfds|dailymed|drug label|prescribing information|"
     r"kcd(?:-\d+)?|icd(?:-\d+)?|statute|regulation|legal requirement|"
-    r"citations?|sources?|pubmed|faers)\b"
+    r"citations?|pubmed|faers)\b"
+    r"|\b(?:cite|provide|include|show|list)\s+sources?\b"
+    r"|\b(?:with|from)\s+sources?\b"
     r"|가이드라인|진료\s*지침|권고안|심평원|급여\s*기준|비급여|보험\s*기준|"
     r"식약처|허가\s*사항|효능.?효과|용법.?용량|약가|상한\s*금액|"
     r"질병\s*코드|상병\s*코드|법령|법률|시행\s*규칙|근거\s*문헌|출처|인용"
+    r")",
+    re.IGNORECASE,
+)
+SOURCE_FOLLOWUP_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:that|this|the)\s+(?:guideline|recommendation|criterion|criteria|"
+    r"citation|label|regulation|law|code)\b"
+    r"|\b(?:what|which)\s+(?:guideline|evidence|citation|reference)\b"
+    r"|\b(?:evidence|citation|reference)\s+(?:for|behind|supporting)\s+(?:that|it)\b"
+    r"|그\s*(?:가이드라인|지침|기준|권고|근거|출처|허가|법령|코드)"
+    r"|해당\s*(?:가이드라인|지침|기준|권고|근거|출처|허가|법령|코드)"
+    r"|(?:그|이)\s*내용의\s*(?:근거|출처)"
     r")",
     re.IGNORECASE,
 )
@@ -123,12 +137,27 @@ def _compact_messages(
 
 
 def _needs_retrieval(messages: list[dict[str, str]]) -> bool:
-    recent_user_text = "\n".join(
-        message.get("content", "")
-        for message in messages
-        if message.get("role") == "user"
+    latest_user_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_user_index is None:
+        return False
+
+    latest_user_text = messages[latest_user_index].get("content", "")
+    if SOURCE_SPECIFIC_PATTERN.search(latest_user_text):
+        return True
+    if not SOURCE_FOLLOWUP_PATTERN.search(latest_user_text):
+        return False
+
+    prior_context = "\n".join(
+        message.get("content", "") for message in messages[:latest_user_index]
     )[-8_000:]
-    return SOURCE_SPECIFIC_PATTERN.search(recent_user_text) is not None
+    return SOURCE_SPECIFIC_PATTERN.search(prior_context) is not None
 
 
 def _conversation_context(messages: list[dict[str, str]]) -> str:
