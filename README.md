@@ -6,9 +6,10 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
 ## 처리 흐름
 
 1. 첫 user 질문과 최근 5개 message를 유지하고 message별 길이를 제한합니다.
-2. 일반 의료 질문은 L2를 한 번 호출해 직접 답합니다.
-3. guideline, 법령, 급여, 허가, drug label, code, citation처럼 외부 근거가 명확히
-   필요한 질문만 retrieval로 보냅니다.
+2. Generation L2에는 `retrieve_relevant_content` 하나만 제공하며, L2가 memory로 직접
+   답할지 self-contained query로 retrieval을 요청할지 결정합니다.
+3. Retrieval 결과는 `role=tool` message로 같은 generation 대화에 전달하고 최종 답변을
+   생성합니다.
 4. Guideline은 결정적 2-step index 조회를 사용하고, 그 밖의 근거 질문은 L2 tool
    selector 1회와 MCP tool 최대 2회로 제한해 18초 안에 끝냅니다.
 5. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.

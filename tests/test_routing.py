@@ -15,7 +15,6 @@ from l2_baseline.harness import (
     _deterministic_guideline_request,
     _deterministic_structured_request,
     _index_page_arguments,
-    _needs_retrieval,
     _prepare_primary_arguments,
     _response_language_instruction,
 )
@@ -106,69 +105,6 @@ def _harness(
 def test_response_language_is_explicit() -> None:
     assert "English only" in _response_language_instruction("My knee clicks")
     assert "Korean" in _response_language_instruction("무릎에서 소리가 나요")
-
-
-def test_router_only_retrieves_source_specific_requests() -> None:
-    assert not _needs_retrieval(
-        [{"role": "user", "content": "What commonly causes a sore throat?"}]
-    )
-    assert _needs_retrieval(
-        [
-            {
-                "role": "user",
-                "content": "According to current clinical guidelines, what is the BP target?",
-            }
-        ]
-    )
-    assert _needs_retrieval(
-        [{"role": "user", "content": "이 약의 식약처 허가사항과 급여 기준을 알려줘"}]
-    )
-
-
-def test_router_uses_latest_turn_for_unrelated_followup() -> None:
-    messages = [
-        {
-            "role": "user",
-            "content": "According to current clinical guidelines, what is the BP target?",
-        },
-        {"role": "assistant", "content": "The guideline recommends a target."},
-        {"role": "user", "content": "What kind of exercise would be practical for me?"},
-    ]
-
-    assert not _needs_retrieval(messages)
-
-
-def test_router_keeps_retrieval_for_source_referential_followup() -> None:
-    english_messages = [
-        {"role": "user", "content": "What do current clinical guidelines recommend?"},
-        {"role": "assistant", "content": "The guideline recommends treatment."},
-        {
-            "role": "user",
-            "content": "Does that recommendation apply to older adults?",
-        },
-    ]
-    korean_messages = [
-        {"role": "user", "content": "심평원 급여 기준을 알려줘"},
-        {"role": "assistant", "content": "현재 급여 기준은 다음과 같습니다."},
-        {"role": "user", "content": "그 기준에 예외도 있어?"},
-    ]
-
-    assert _needs_retrieval(english_messages)
-    assert _needs_retrieval(korean_messages)
-
-
-def test_router_does_not_treat_causal_source_as_citation_request() -> None:
-    assert not _needs_retrieval(
-        [{"role": "user", "content": "What could be the source of this shoulder pain?"}]
-    )
-    assert not _needs_retrieval(
-        [
-            {
-                "role": "user",
-                "content": "According to my doctor, this may be muscular. What do you think?",
-            }
-        ]
-    )
 
 
 def test_compaction_preserves_first_user_request_and_recent_turns() -> None:
@@ -357,7 +293,11 @@ def test_direct_route_uses_one_l2_call() -> None:
 
     assert answer == "direct answer"
     assert create.await_count == 1
-    assert "tools" not in create.await_args.kwargs
+    request = create.await_args.kwargs
+    assert [tool["function"]["name"] for tool in request["tools"]] == [
+        "retrieve_relevant_content"
+    ]
+    assert request["tool_choice"] == "auto"
     assert mcp.calls == []
 
 
@@ -410,7 +350,25 @@ def test_empty_then_transient_500_can_recover_within_local_budget() -> None:
 
 
 def test_source_route_opens_one_page_then_runs_final_generation() -> None:
-    harness, create, mcp = _harness([_response(content="grounded answer")])
+    harness, create, mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        json.dumps(
+                            {
+                                "query": (
+                                    "current clinical guideline CKD blood pressure target"
+                                )
+                            }
+                        ),
+                    )
+                ]
+            ),
+            _response(content="grounded answer"),
+        ]
+    )
 
     answer = asyncio.run(
         harness.chat(
@@ -424,7 +382,7 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     )
 
     assert answer == "grounded answer"
-    assert create.await_count == 1
+    assert create.await_count == 2
     assert len(mcp.calls) == 2
     assert [name for name, _arguments in mcp.calls] == [
         "index_get_relevant_nodes",
@@ -432,28 +390,84 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     ]
     assert mcp.calls[0][1]["corpus_tag"] == "guideline"
     assert mcp.calls[0][1]["k"] == 8
-    assert "CKD BP target" in mcp.calls[0][1]["query"]
+    assert "CKD blood pressure target" in mcp.calls[0][1]["query"]
     assert mcp.calls[1][1] == {
         "corpus_tag": "guideline",
         "doc_id": "ckd-guide",
         "start_page": 12,
         "end_page": 14,
     }
-    final_request = create.await_args_list[0].kwargs
-    assert "tools" not in final_request
-    assert "cite-1" in final_request["messages"][0]["content"]
+    decision_request = create.await_args_list[0].kwargs
+    assert decision_request["tool_choice"] == "auto"
+    final_request = create.await_args_list[1].kwargs
+    assert final_request["tool_choice"] == "none"
+    assert [tool["function"]["name"] for tool in final_request["tools"]] == [
+        "retrieve_relevant_content"
+    ]
+    assert final_request["messages"][-2]["role"] == "assistant"
+    assert final_request["messages"][-1]["role"] == "tool"
+    assert "cite-1" in final_request["messages"][-1]["content"]
+
+
+def test_text_tool_call_passes_a_self_contained_multiturn_query_to_retrieval() -> None:
+    text_call = (
+        "<tool_call>retrieve_relevant_content"
+        "<arg_key>query</arg_key>"
+        "<arg_value>current clinical guideline anticoagulation recommendation for a "
+        "68-year-old patient with atrial fibrillation taking warfarin</arg_value>"
+        "</tool_call>"
+    )
+    harness, create, mcp = _harness(
+        [_response(content=text_call), _response(content="grounded follow-up [1]")]
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": "I am 68, have atrial fibrillation, and take warfarin.",
+                },
+                {"role": "assistant", "content": "Understood."},
+                {
+                    "role": "user",
+                    "content": "What do current guidelines recommend about it?",
+                },
+            ]
+        )
+    )
+
+    assert answer == "grounded follow-up [1]"
+    assert create.await_count == 2
+    assert len(mcp.calls) == 2
+    assert "68-year-old" in mcp.calls[0][1]["query"]
+    assert "atrial fibrillation" in mcp.calls[0][1]["query"]
+    assert create.await_args_list[1].kwargs["messages"][-2]["tool_calls"][0][
+        "id"
+    ].startswith("generation-text-retrieve")
 
 
 def test_structured_source_route_skips_l2_tool_selection() -> None:
-    harness, create, mcp = _harness([_response(content="E11 [1]")])
+    harness, create, mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        '{"query":"당뇨병의 정확한 KCD 코드"}',
+                    )
+                ]
+            ),
+            _response(content="E11 [1]"),
+        ]
+    )
 
     answer = asyncio.run(
         harness.chat([{"role": "user", "content": "당뇨병의 정확한 KCD 코드는?"}])
     )
 
     assert answer == "E11 [1]"
-    assert create.await_count == 1
-    assert "tools" not in create.await_args.kwargs
+    assert create.await_count == 2
     assert mcp.calls == [
         (
             "kcd_search_codes",
@@ -463,7 +477,19 @@ def test_structured_source_route_skips_l2_tool_selection() -> None:
 
 
 def test_mfds_detail_route_checks_permission_then_indication() -> None:
-    harness, create, mcp = _harness([_response(content="허가 적응증 답변 [1] [2]")])
+    harness, create, mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        '{"query":"키트루다 식약처 허가사항과 용법용량"}',
+                    )
+                ]
+            ),
+            _response(content="허가 적응증 답변 [1] [2]"),
+        ]
+    )
 
     answer = asyncio.run(
         harness.chat(
@@ -472,7 +498,7 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
     )
 
     assert answer == "허가 적응증 답변 [1] [2]"
-    assert create.await_count == 1
+    assert create.await_count == 2
     assert mcp.calls == [
         (
             "openapi_mfds_check_drug_permission",
@@ -491,7 +517,19 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
 
 
 def test_retrieval_failure_still_runs_final_l2_generation() -> None:
-    harness, create, _mcp = _harness([_response(content="safe answer with limitation")])
+    harness, create, _mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        '{"query":"exact guideline recommendation"}',
+                    )
+                ]
+            ),
+            _response(content="safe answer with limitation"),
+        ]
+    )
     harness.retrieve = AsyncMock(side_effect=TimeoutError)
 
     answer = asyncio.run(
@@ -501,5 +539,8 @@ def test_retrieval_failure_still_runs_final_l2_generation() -> None:
     )
 
     assert answer == "safe answer with limitation"
-    assert create.await_count == 1
-    assert "Retrieval was unavailable" in create.await_args.kwargs["messages"][0]["content"]
+    assert create.await_count == 2
+    assert (
+        "Retrieval was unavailable"
+        in create.await_args.kwargs["messages"][-1]["content"]
+    )
