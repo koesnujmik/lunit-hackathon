@@ -19,7 +19,7 @@ def _read_user_message(args_message: list[str]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run one answer through the two-phase L2 harness.")
+    parser = argparse.ArgumentParser(description="Run one answer through the minimal L2 driver.")
     parser.add_argument("message", nargs="*", help="User message to answer.")
     args = parser.parse_args()
 

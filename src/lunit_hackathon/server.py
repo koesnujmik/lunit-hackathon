@@ -8,8 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .answer import generate_answer
-from .api import APIError
+from .answer import fallback_answer, generate_answer
 from .config import load_settings
 
 
@@ -57,9 +56,22 @@ class ChatHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
             return
-        except (RuntimeError, APIError) as exc:
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": str(exc)}})
-            return
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {"event": "request_fallback", "error_type": type(exc).__name__}
+                ),
+                flush=True,
+            )
+            fallback_messages = request_body.get("messages", [])
+            normalized_fallback = (
+                [self._normalize_message(message) for message in fallback_messages]
+                if isinstance(fallback_messages, list)
+                else []
+            )
+            response_body = self._completion_response(
+                request_body, fallback_answer(normalized_fallback)
+            )
 
         self._send_json(HTTPStatus.OK, response_body)
 
@@ -97,6 +109,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         normalized_messages = [self._normalize_message(message) for message in messages]
         settings = load_settings()
         answer = generate_answer(settings, normalized_messages)
+        return self._completion_response(body, answer)
+
+    @staticmethod
+    def _completion_response(body: dict[str, Any], answer: str) -> dict[str, Any]:
         response_model = body.get("model") if isinstance(body.get("model"), str) else DRIVER_MODEL_ID
 
         return {
@@ -161,6 +177,7 @@ def main() -> None:
     host = "0.0.0.0"
     port = 8000
     server = ThreadingHTTPServer((host, port), ChatHandler)
+    server.daemon_threads = True
     print(f"Serving on {host}:{port}", flush=True)
     server.serve_forever()
 

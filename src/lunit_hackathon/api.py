@@ -93,23 +93,3 @@ def first_choice_message(response: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise APIError(f"Expected message object, got {type(message).__name__}.")
     return message
-
-
-def message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_calls = message.get("tool_calls")
-    if raw_calls is None:
-        return []
-    if not isinstance(raw_calls, list) or not all(isinstance(item, dict) for item in raw_calls):
-        raise APIError(f"Expected tool_calls list, got {raw_calls!r}.")
-    return raw_calls
-
-
-def assistant_message_for_history(message: dict[str, Any]) -> dict[str, Any]:
-    history_message: dict[str, Any] = {
-        "role": "assistant",
-        "content": message.get("content"),
-    }
-    tool_calls = message_tool_calls(message)
-    if tool_calls:
-        history_message["tool_calls"] = tool_calls
-    return history_message
