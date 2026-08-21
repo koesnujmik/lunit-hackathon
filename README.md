@@ -19,23 +19,6 @@ HyDE 단계에서 생성하는 rationale은 최대 140단어로, 필요한 임�
 ranking에만 사용하고 실제 evidence로 인용하지 않습니다. 비공개 chain-of-thought 대신 근거
 부족분과 다음 action을 설명하는 짧은 `analysis_summary`만 전달합니다.
 
-### Tool dependency workflow
-
-의존성이 있는 MCP tool은 현재 workflow state에서 실행 가능한 단계만 selector에 제공합니다.
-각 tool 결과에서 `doc_id`, `node_id`, page range, MST, article key, KCD code, 의약품 식별자를
-추출하며, 다음 단계의 필수 인자가 준비되면 추가 L2 planning 없이 자동으로 진행합니다.
-
-```text
-guideline/HIRA: list_documents → relevant_nodes/structure → page_content
-law:            law_search → list_articles → get_article
-KCD:            search_codes → get_name
-MFDS:           check_permission/find_by_ingredient → get_drug_indication
-```
-
-필수 인자를 자동으로 채울 수 없는 경우에만 해당 workflow의 다음 frontier를 L2에 전달합니다.
-DailyMed, HIRA update, PubMed, FAERS처럼 독립적으로 실행 가능한 tool은 기존 selector 흐름을
-그대로 사용합니다.
-
 ## 로컬 Python 실행
 
 Python 3.11 이상이 필요합니다.
