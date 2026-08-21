@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -6,15 +7,9 @@ from openai import AsyncOpenAI
 
 from .config import Settings
 from .mcp_client import LunitMCPClient
-from .models import CitationSelection, Evidence, ReflectionDecision, RetrievalResult
-from .prompts import (
-    GENERATION_SYSTEM_PROMPT,
-    HYDE_SYSTEM_PROMPT,
-    REACT_ACTION_SYSTEM_PROMPT,
-    REFLECTION_SYSTEM_PROMPT,
-    TOOL_SELECTOR_SYSTEM_PROMPT,
-)
-from .ranking import rank_documents, rank_tool_candidates
+from .models import CitationSelection, Evidence, RetrievalResult
+from .prompts import GENERATION_SYSTEM_PROMPT, RETRIEVAL_SYSTEM_PROMPT
+from .ranking import rank_documents
 
 
 def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -35,37 +30,8 @@ def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> d
 
 RETRIEVE_TOOL = _decision_tool(
     "retrieve_relevant_content",
-    "Retrieve real evidence. Pass one self-contained query that resolves conversation context.",
-    {"query": {"type": "string"}},
-)
-REFLECTION_TOOL = _decision_tool(
-    "submit_reflection",
-    "Submit evidence sufficiency and the next retrieval query.",
-    {
-        "sufficient": {"type": "boolean"},
-        "analysis_summary": {"type": "string"},
-        "next_query": {"type": "string"},
-    },
-)
-FINALIZE_TOOL = _decision_tool(
-    "finalize_retrieval",
-    "Select citations and end retrieval.",
-    {
-        "status": {"type": "string", "enum": ["sufficient", "partial", "no_evidence"]},
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "cite_uid": {"type": "string"},
-                    "relevance_score": {"type": "number", "minimum": 0, "maximum": 1},
-                },
-                "required": ["cite_uid", "relevance_score"],
-                "additionalProperties": False,
-            },
-        },
-        "note": {"type": "string"},
-    },
+    "Retrieve evidence for claims that require an external source. Pass one self-contained query.",
+    {"query": {"type": "string", "minLength": 1}},
 )
 
 
@@ -94,7 +60,16 @@ def _response_language_instruction(text: str) -> str:
     return "Respond in the same language as the user's latest message."
 
 
+def _conversation_context(messages: list[dict[str, str]], max_chars: int = 12_000) -> str:
+    rendered = "\n\n".join(
+        f"{message.get('role', 'user').upper()}: {message.get('content', '')}"
+        for message in messages
+    )
+    return rendered[-max_chars:]
+
+
 def _extract_evidence(tool_outputs: list[str], selection: CitationSelection) -> list[Evidence]:
+    """Retained for compatibility with explicit citation selections."""
     evidence: list[Evidence] = []
     for selected in selection.items:
         matching = [text for text in tool_outputs if selected.cite_uid in text]
@@ -109,15 +84,6 @@ def _extract_evidence(tool_outputs: list[str], selection: CitationSelection) -> 
     return evidence
 
 
-def _evidence_context(evidence: list[Evidence]) -> str:
-    if not evidence:
-        return "No citable evidence yet."
-    return "\n\n".join(
-        f"[{index}] cite_uid={item.cite_uid} tfidf={item.tfidf_score:.4f}\n{item.content}"
-        for index, item in enumerate(evidence, 1)
-    )
-
-
 class L2Harness:
     def __init__(
         self,
@@ -130,193 +96,191 @@ class L2Harness:
             api_key=self.settings.token,
             base_url=self.settings.api_url.rstrip("/") + "/v1",
             timeout=self.settings.request_timeout_sec,
-            max_retries=2,
+            max_retries=0,
         )
         self.mcp_factory = mcp_factory
 
-    async def _forced_decision(
-        self, system_prompt: str, user_content: str, tool: dict[str, Any]
-    ) -> dict[str, Any]:
-        name = tool["function"]["name"]
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            tools=[tool],
-            tool_choice="required",
-            temperature=0,
-        )
-        calls = response.choices[0].message.tool_calls or []
-        if not calls:
-            raise RuntimeError(f"L2 did not call required tool {name}")
-        return _arguments(calls[0].function.arguments)
-
-    async def create_hypothetical_passage(self, query: str) -> str:
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[
-                {"role": "system", "content": HYDE_SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            temperature=0.2,
-        )
-        return (response.choices[0].message.content or query).strip()
-
-    async def _choose_actions(
-        self,
-        tools: list[dict[str, Any]],
-        query: str,
-        passage: str,
-        evidence: list[Evidence] | None = None,
-        observations: list[str] | None = None,
-        reflection: ReflectionDecision | None = None,
-    ) -> list[Any]:
-        if reflection is None:
-            system = TOOL_SELECTOR_SYSTEM_PROMPT
-            content = f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
-        else:
-            system = REACT_ACTION_SYSTEM_PROMPT
-            recent = "\n\n".join((observations or [])[-3:])[-12000:]
-            content = (
-                f"QUERY:\n{query}\n\nHYPOTHETICAL PASSAGE:\n{passage}"
-                f"\n\nTOP REAL EVIDENCE:\n{_evidence_context(evidence or [])}"
-                f"\n\nRECENT TOOL OBSERVATIONS:\n{recent or 'None'}"
-                f"\n\nREFLECTION SUMMARY:\n{reflection.analysis_summary}"
-                f"\n\nNEXT QUERY:\n{reflection.next_query}"
-            )
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
-            tools=tools,
-            tool_choice="required",
-            temperature=0,
-        )
-        return response.choices[0].message.tool_calls or []
-
-    async def _reflect(
-        self, query: str, evidence: list[Evidence], round_number: int
-    ) -> ReflectionDecision:
-        content = (
-            f"QUERY:\n{query}\n\nROUND: {round_number}"
-            f"\n\nCURRENT REAL EVIDENCE:\n{_evidence_context(evidence)}"
-        )
-        arguments = await self._forced_decision(
-            REFLECTION_SYSTEM_PROMPT, content, REFLECTION_TOOL
-        )
-        return ReflectionDecision.model_validate(arguments)
-
-    async def _finalize(
-        self, query: str, evidence: list[Evidence], sufficient: bool, note: str
-    ) -> RetrievalResult:
-        if not evidence:
-            return RetrievalResult(status="no_evidence", note=note)
-        content = (
-            f"Query: {query}\n\nCandidates:\n{_evidence_context(evidence)}\n\n"
-            f"Reflection sufficient={sufficient}. Call finalize_retrieval now."
-        )
-        arguments = await self._forced_decision(
-            "Select final cite_uids only from supplied real evidence. Do not answer.",
-            content,
-            FINALIZE_TOOL,
-        )
-        selection = CitationSelection.model_validate(arguments)
-        allowed = {item.cite_uid: item for item in evidence}
-        selected = [allowed[item.cite_uid] for item in selection.items if item.cite_uid in allowed]
-        return RetrievalResult(
-            status=selection.status if selected else "no_evidence",
-            evidence=selected,
-            note=selection.note or note,
-        )
-
-    async def retrieve(self, query: str) -> RetrievalResult:
-        passage = await self.create_hypothetical_passage(query)
+    async def retrieve(self, messages: list[dict[str, str]]) -> RetrievalResult:
+        query = _conversation_context(messages)
+        retrieval_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": RETRIEVAL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Use the available MCP tools to collect evidence for the latest user request. "
+                    "Resolve references from the full conversation below.\n\n"
+                    f"CONVERSATION:\n{query}"
+                ),
+            },
+        ]
         documents: list[str] = []
         action_count = 0
-        evidence: list[Evidence] = []
-        reflection = ReflectionDecision(
-            sufficient=False,
-            analysis_summary="Initial selection has not run.",
-            next_query=query,
-        )
+
         async with self.mcp_factory(
-            self.settings.mcp_url, self.settings.token, self.settings.request_timeout_sec
+            self.settings.mcp_url,
+            self.settings.token,
+            self.settings.request_timeout_sec,
         ) as mcp:
             tools = await mcp.openai_tools()
-            candidate_tools = rank_tool_candidates(
-                f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
-            )
-            actions = await self._choose_actions(candidate_tools, query, passage)
-            for round_number in range(1, self.settings.max_reflection_rounds + 1):
-                for action in actions:
-                    if action_count >= self.settings.max_retrieval_calls:
-                        break
-                    output = await mcp.call(action.function.name, _arguments(action.function.arguments))
-                    documents.append(output)
-                    action_count += 1
-                evidence = rank_documents(passage, documents, self.settings.retrieval_top_k)
-                reflection = await self._reflect(query, evidence, round_number)
-                if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
-                    break
-                actions = await self._choose_actions(
-                    candidate_tools,
-                    query,
-                    passage,
-                    evidence=evidence,
-                    observations=documents,
-                    reflection=reflection,
+            if not tools:
+                return RetrievalResult(
+                    status="no_evidence",
+                    note="The MCP server returned no tools.",
                 )
-        result = await self._finalize(
-            query, evidence, reflection.sufficient, reflection.analysis_summary
+            _log("retrieval_started", available_tools=len(tools))
+
+            for round_number in range(1, self.settings.max_retrieval_rounds + 1):
+                response = await self.client.chat.completions.create(
+                    model=self.settings.model,
+                    messages=retrieval_messages,
+                    tools=tools,
+                    tool_choice="required" if round_number == 1 else "auto",
+                    temperature=0,
+                    max_tokens=self.settings.retrieval_max_tokens,
+                )
+                message = response.choices[0].message
+                calls = message.tool_calls or []
+                if not calls:
+                    _log("retrieval_completed", round=round_number, tool_calls=action_count)
+                    break
+
+                retrieval_messages.append(_assistant_message(message))
+                _log("retrieval_round", round=round_number, requested_calls=len(calls))
+
+                for call in calls:
+                    if action_count >= self.settings.max_retrieval_calls:
+                        output = "Retrieval tool-call budget exhausted."
+                    else:
+                        _log(
+                            "mcp_call_started",
+                            tool=call.function.name,
+                            call_number=action_count + 1,
+                        )
+                        try:
+                            output = await mcp.call(
+                                call.function.name,
+                                _arguments(call.function.arguments),
+                            )
+                        except Exception as exc:  # noqa: BLE001 - isolate one MCP failure
+                            _log(
+                                "mcp_call_failed",
+                                tool=call.function.name,
+                                error_type=type(exc).__name__,
+                            )
+                            output = f"MCP tool unavailable: {type(exc).__name__}"
+                        else:
+                            action_count += 1
+                            _log(
+                                "mcp_call_completed",
+                                tool=call.function.name,
+                                output_chars=len(output),
+                            )
+                            if output and not output.startswith("MCP tool error:"):
+                                documents.append(
+                                    output[: self.settings.max_tool_result_chars]
+                                )
+
+                    retrieval_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": output[: self.settings.max_tool_result_chars],
+                        }
+                    )
+
+                if action_count >= self.settings.max_retrieval_calls:
+                    _log("retrieval_budget_exhausted", tool_calls=action_count)
+                    break
+
+        evidence = rank_documents(query, documents, self.settings.retrieval_top_k)
+        if not evidence:
+            return RetrievalResult(
+                status="no_evidence",
+                note="MCP retrieval returned no citable evidence.",
+                tool_calls=action_count,
+            )
+        return RetrievalResult(
+            status="partial",
+            evidence=evidence,
+            note="MCP retrieval returned the most relevant citable evidence.",
+            tool_calls=action_count,
         )
-        result.tool_calls = action_count
-        return result
 
     async def chat(self, messages: list[dict[str, str]]) -> str:
         if not messages or messages[-1].get("role") != "user":
             raise ValueError("messages must end with a user message")
+
         generation_prompt = (
             GENERATION_SYSTEM_PROMPT
             + "\n"
             + _response_language_instruction(messages[-1]["content"])
         )
         generation_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": generation_prompt}, *messages
+            {"role": "system", "content": generation_prompt},
+            *messages,
         ]
-        response = await self.client.chat.completions.create(
+        first_response = await self.client.chat.completions.create(
             model=self.settings.model,
             messages=generation_messages,
             tools=[RETRIEVE_TOOL],
             tool_choice="auto",
-            temperature=0.2,
+            temperature=0,
+            max_tokens=self.settings.generation_max_tokens,
         )
-        message = response.choices[0].message
-        calls = message.tool_calls or []
+        first_message = first_response.choices[0].message
+        calls = first_message.tool_calls or []
         if not calls:
-            return message.content or ""
+            content = first_message.content or ""
+            if not content.strip():
+                raise RuntimeError("L2 returned neither an answer nor a retrieval request")
+            _log("generation_memory_answer")
+            return content
+
         retrieve_calls = [
-            call for call in calls if call.function.name == "retrieve_relevant_content"
+            call for call in calls if call.function.name == RETRIEVE_TOOL["function"]["name"]
         ]
         if not retrieve_calls:
             raise RuntimeError("Generation returned an unsupported tool call")
 
         selected_call = retrieve_calls[0]
-        query = _arguments(selected_call.function.arguments)["query"]
-        result = await self.retrieve(query)
-        generation_messages.append(_assistant_message(message))
+        query = _arguments(selected_call.function.arguments).get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise RuntimeError("Generation returned an empty retrieval query")
+        query = query.strip()
+        _log("generation_requested_retrieval", query_chars=len(query))
+
+        try:
+            async with asyncio.timeout(self.settings.retrieval_timeout_sec):
+                retrieval = await self.retrieve([{"role": "user", "content": query}])
+        except Exception as exc:  # noqa: BLE001 - retrieval failure must not lose the answer
+            _log("retrieval_unavailable", error_type=type(exc).__name__)
+            retrieval = RetrievalResult(
+                status="no_evidence",
+                note="Retrieval was unavailable within the response-time budget.",
+            )
+
+        generation_messages.append(_assistant_message(first_message))
         for call in calls:
             content = (
-                result.for_generation()
+                retrieval.for_generation(self.settings.max_evidence_chars)
                 if call.id == selected_call.id
                 else "Only one retrieval call is allowed per answer."
             )
             generation_messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": content}
             )
+
         final_response = await self.client.chat.completions.create(
             model=self.settings.model,
             messages=generation_messages,
-            temperature=0.2,
+            temperature=0,
+            max_tokens=self.settings.generation_max_tokens,
         )
-        return final_response.choices[0].message.content or ""
+        content = final_response.choices[0].message.content or ""
+        if not content.strip():
+            raise RuntimeError("L2 returned an empty generation response")
+        return content
+
+
+def _log(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}), flush=True)

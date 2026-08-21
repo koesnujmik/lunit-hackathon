@@ -17,23 +17,31 @@ class LunitMCPClient:
 
     async def __aenter__(self) -> Self:
         self._stack = AsyncExitStack()
-        http_client = await self._stack.enter_async_context(
-            httpx.AsyncClient(
-                headers=self.headers,
-                timeout=httpx.Timeout(self.timeout_sec),
-                follow_redirects=True,
+        try:
+            http_client = await self._stack.enter_async_context(
+                httpx.AsyncClient(
+                    headers=self.headers,
+                    timeout=httpx.Timeout(self.timeout_sec),
+                    follow_redirects=True,
+                )
             )
-        )
-        read, write, _ = await self._stack.enter_async_context(
-            streamable_http_client(self.url, http_client=http_client)
-        )
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
+            read, write, _ = await self._stack.enter_async_context(
+                streamable_http_client(self.url, http_client=http_client)
+            )
+            self._session = await self._stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+        except BaseException:
+            await self._stack.aclose()
+            self._stack = None
+            self._session = None
+            raise
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         if self._stack:
             await self._stack.aclose()
+            self._stack = None
+            self._session = None
 
     async def openai_tools(self) -> list[dict[str, Any]]:
         assert self._session
