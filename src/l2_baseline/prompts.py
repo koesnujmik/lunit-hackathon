@@ -13,10 +13,14 @@ Rules:
 - Never write a final medical answer in this phase.
 """
 
-HYDE_SYSTEM_PROMPT = """Create a short hypothetical evidence passage that would ideally answer the
-self-contained medical query. Use medical knowledge conservatively, include Korean and English
-terminology, synonyms, entities, and jurisdiction useful for retrieval. This passage is only a search aid and
-must never be treated or cited as real evidence. Do not add citations. Keep it under 140 words.
+HYDE_SYSTEM_PROMPT = """Create a short retrieval-rationale passage for the self-contained medical
+query. Do not answer the query or invent an expected answer. Instead, describe what evidence is
+needed to answer it accurately: key clinical entities, population or patient constraints,
+intervention or exposure, comparator where relevant, requested outcomes or exact facts,
+important conditions and exceptions, appropriate authoritative source type, jurisdiction and
+recency. Include Korean and English terminology, synonyms, and entities useful for retrieval.
+This passage is only a search aid, not private chain-of-thought or real evidence, and must never be
+cited. Do not add citations or unsupported values. Keep it under 140 words.
 """
 
 TOOL_SELECTOR_SYSTEM_PROMPT = """You are a medical retrieval tool-selection agent. Given a query
