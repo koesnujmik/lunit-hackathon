@@ -15,6 +15,7 @@ from l2_baseline.harness import (
     _deterministic_guideline_request,
     _deterministic_structured_request,
     _guideline_focus_queries,
+    _has_explicit_retrieval_intent,
     _index_page_argument_candidates,
     _index_page_arguments,
     _index_relevant_nodes_arguments,
@@ -232,6 +233,14 @@ def _harness(
 def test_response_language_is_explicit() -> None:
     assert "English only" in _response_language_instruction("My knee clicks")
     assert "Korean" in _response_language_instruction("무릎에서 소리가 나요")
+
+
+def test_explicit_retrieval_intent_separates_general_and_source_questions() -> None:
+    assert not _has_explicit_retrieval_intent(
+        "68세이며 와파린을 복용 중입니다. 무릎 통증에 이부프로펜을 먹어도 되나요?"
+    )
+    assert _has_explicit_retrieval_intent("최신 진료 지침의 권고와 출처를 알려주세요")
+    assert _has_explicit_retrieval_intent("What does the authoritative source recommend?")
 
 
 def test_compaction_preserves_first_user_request_and_recent_turns() -> None:
@@ -564,10 +573,43 @@ def test_direct_route_uses_one_l2_call() -> None:
     assert answer == "direct answer"
     assert create.await_count == 1
     request = create.await_args.kwargs
-    assert [tool["function"]["name"] for tool in request["tools"]] == [
-        "retrieve_relevant_content"
-    ]
-    assert request["tool_choice"] == "auto"
+    assert "tools" not in request
+    assert "tool_choice" not in request
+    assert mcp.calls == []
+
+
+def test_general_question_rejects_spurious_retrieval_request() -> None:
+    harness, create, mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        '{"query":"HIRA reimbursement for knee pain"}',
+                    )
+                ]
+            ),
+            _response(content="이부프로펜은 피하고 진료를 받으세요."),
+        ]
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "68세이고 와파린을 복용 중입니다. 무릎 통증에 이부프로펜을 "
+                        "먹어도 되나요?"
+                    ),
+                }
+            ]
+        )
+    )
+
+    assert answer == "이부프로펜은 피하고 진료를 받으세요."
+    assert create.await_count == 2
+    assert all("tools" not in call.kwargs for call in create.await_args_list)
     assert mcp.calls == []
 
 

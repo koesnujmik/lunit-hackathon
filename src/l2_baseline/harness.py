@@ -82,6 +82,14 @@ HIRA_MARKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MFDS_MARKER_PATTERN = re.compile(r"\bmfds\b|식약처", re.IGNORECASE)
+EXPLICIT_EVIDENCE_REQUEST_PATTERN = re.compile(
+    r"\b(?:according\s+to|authoritative\s+source|official\s+source|sources?|"
+    r"citations?|cite|evidence|research|stud(?:y|ies)|literature|publication|"
+    r"latest|up[- ]to[- ]date)\b|"
+    r"출처|인용|근거(?:를|가|에|로|와|도|만|는|은)?\b|논문|연구|문헌|공식\s*자료|"
+    r"최신(?:의|자료|정보|연구|논문|권고|지침|기준)?",
+    re.IGNORECASE,
+)
 MFDS_DETAIL_PATTERN = re.compile(
     r"허가\s*사항|적응증|효능.?효과|용법.?용량|금기|상호작용|임부|소아|고령자|"
     r"신장애|경고|\bindications?\b|\bdos(?:e|age)\b|\badministration\b|"
@@ -359,6 +367,15 @@ def _response_language_instruction(text: str) -> str:
     if any(character.isascii() and character.isalpha() for character in text):
         return "The required response language is English. Respond in English only."
     return "Respond in the same language as the user's latest message."
+
+
+def _has_explicit_retrieval_intent(context: str) -> bool:
+    """Keep stable medical questions on the fast memory-only generation path."""
+    return bool(
+        GUIDELINE_INDEX_PATTERN.search(context)
+        or OTHER_OFFICIAL_SOURCE_PATTERN.search(context)
+        or EXPLICIT_EVIDENCE_REQUEST_PATTERN.search(context)
+    )
 
 
 def _truncate_middle(text: str, limit: int) -> str:
@@ -1485,7 +1502,11 @@ class L2Harness:
         return result
 
     async def _start_generation(
-        self, system_prompt: str, messages: list[dict[str, Any]]
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        *,
+        allow_retrieval: bool = True,
     ) -> tuple[str | None, _GenerationRetrievalRequest | None]:
         """Let L2 answer from memory or request the generation stage's only tool."""
         last_finish_reason: str | None = None
@@ -1493,25 +1514,38 @@ class L2Harness:
             attempt_prompt = system_prompt
             attempt_max_tokens = self.settings.generation_max_tokens
             if attempt:
-                attempt_prompt += (
-                    "\n\nRECOVERY INSTRUCTION: Return a non-empty answer now, or call "
-                    "retrieve_relevant_content once with a self-contained query if authoritative "
-                    "evidence is required. Do not return hidden reasoning or an empty response."
-                )
+                if allow_retrieval:
+                    attempt_prompt += (
+                        "\n\nRECOVERY INSTRUCTION: Return a non-empty answer now, or call "
+                        "retrieve_relevant_content once with a self-contained query if "
+                        "authoritative evidence is required. Do not return hidden reasoning or "
+                        "an empty response."
+                    )
+                else:
+                    attempt_prompt += (
+                        "\n\nRECOVERY INSTRUCTION: This is a stable general medical question "
+                        "that does not request an external source. Return a non-empty answer now "
+                        "from medical knowledge. Do not request retrieval or return hidden "
+                        "reasoning."
+                    )
                 attempt_max_tokens = (
                     2_048
                     if last_finish_reason == "length"
                     else min(attempt_max_tokens, 512)
                 )
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.settings.model,
-                    messages=[{"role": "system", "content": attempt_prompt}, *messages],
-                    tools=[RETRIEVE_RELEVANT_CONTENT_TOOL],
-                    tool_choice="auto",
-                    temperature=0,
-                    max_tokens=attempt_max_tokens,
-                )
+                request: dict[str, Any] = {
+                    "model": self.settings.model,
+                    "messages": [{"role": "system", "content": attempt_prompt}, *messages],
+                    "temperature": 0,
+                    "max_tokens": attempt_max_tokens,
+                }
+                if allow_retrieval:
+                    request.update(
+                        tools=[RETRIEVE_RELEVANT_CONTENT_TOOL],
+                        tool_choice="auto",
+                    )
+                response = await self.client.chat.completions.create(**request)
             except APIStatusError as exc:
                 if exc.status_code >= 500 and attempt < 2:
                     _log(
@@ -1525,7 +1559,11 @@ class L2Harness:
 
             choice = response.choices[0]
             message = choice.message
-            retrieval_request = _generation_retrieval_request(message, attempt + 1)
+            retrieval_request = (
+                _generation_retrieval_request(message, attempt + 1)
+                if allow_retrieval
+                else None
+            )
             if retrieval_request is not None:
                 return None, retrieval_request
 
@@ -1712,6 +1750,9 @@ class L2Harness:
             for message in compact_messages
             if message.get("role") == "user"
         )
+        explicit_retrieval_intent = _has_explicit_retrieval_intent(
+            user_routing_context
+        )
         if GUIDELINE_INDEX_PATTERN.search(
             user_routing_context
         ) and not OTHER_OFFICIAL_SOURCE_PATTERN.search(user_routing_context):
@@ -1726,8 +1767,18 @@ class L2Harness:
                 query_chars=len(retrieval_request.query),
             )
         else:
+            if not explicit_retrieval_intent:
+                generation_prompt += (
+                    "\n\nThe conversation does not explicitly request a guideline, official "
+                    "source, current evidence, citation, law, reimbursement rule, approval, "
+                    "label, or code. Answer directly from stable medical knowledge. No retrieval "
+                    "tool is available for this turn."
+                )
+                _log("generation_memory_only", strategy="no_explicit_evidence_request")
             memory_answer, retrieval_request = await self._start_generation(
-                generation_prompt, compact_messages
+                generation_prompt,
+                compact_messages,
+                allow_retrieval=explicit_retrieval_intent,
             )
         if memory_answer is not None:
             _log("generation_memory_answer")
