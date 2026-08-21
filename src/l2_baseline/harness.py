@@ -1841,7 +1841,8 @@ class L2Harness:
             },
         ]
         final_generation_started = time.monotonic()
-        final_max_tokens = min(self.settings.generation_max_tokens, 1_536)
+        final_token_cap = 1_536 if retrieval.evidence else 1_024
+        final_max_tokens = min(self.settings.generation_max_tokens, final_token_cap)
         _log(
             "final_generation_started",
             max_tokens=final_max_tokens,

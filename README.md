@@ -72,6 +72,24 @@ Invoke-RestMethod `
 Evaluator가 전달한 `messages` 중 첫 user 질문과 최근 5개를 별도의 session ID 없이 사용합니다.
 `stream: true`에는 OpenAI-compatible SSE 형식으로 응답합니다.
 
+## 3턴 Patient Simulator
+
+Docker 제출 API가 `127.0.0.1:8001`에서 실행 중일 때 공식
+`patient-simulator-ko`가 시작 질문과 후속 발화를 생성하여 총 3턴을 실험합니다.
+
+```bash
+uv run l2-simulator \
+  --conversations 1 \
+  --turns 3 \
+  --assistant-api-base http://127.0.0.1:8001/v1 \
+  --output /tmp/lunit-frontier-smoke.json
+```
+
+환자 API에는 0·2·4개, 제출 API에는 1·3·5개의 누적 message를 전달합니다.
+공식 시뮬레이터가 정해진 한국어 시작 질문을 선택하므로 임의 시작 질문을 주입하지 않습니다.
+기본 `--duplicate-retries 0`은 실제 심사 흐름처럼 중복 후속 질문을 그대로 기록합니다.
+다양성 탐색 시에만 `--duplicate-retries 1`을 사용합니다.
+
 ## Docker 검증
 
 ```powershell

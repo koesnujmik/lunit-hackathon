@@ -1077,6 +1077,7 @@ def test_retrieval_failure_still_runs_final_l2_generation() -> None:
         "Retrieval was unavailable"
         in create.await_args.kwargs["messages"][-1]["content"]
     )
+    assert create.await_args.kwargs["max_tokens"] == 1_024
 
 
 def test_retrieval_model_sees_all_mcp_tools_plus_finalize() -> None:
