@@ -21,7 +21,7 @@ from .models import (
 )
 
 SERVED_MODEL = "Lunit/L2-preview"
-MODE = "bounded-source-retrieval"
+MODE = "contract-aware-bounded-retrieval"
 MODEL_CONCURRENCY = 8
 _model_slot = asyncio.Semaphore(MODEL_CONCURRENCY)
 

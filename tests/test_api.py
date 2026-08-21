@@ -25,10 +25,10 @@ def test_models_endpoint() -> None:
     assert response.json()["data"][0]["id"] == "Lunit/L2-preview"
 
 
-def test_health_identifies_bounded_retrieval_mode() -> None:
+def test_health_identifies_contract_aware_retrieval_mode() -> None:
     response = TestClient(api.app).get("/health")
     assert response.status_code == 200
-    assert response.json()["mode"] == "bounded-source-retrieval"
+    assert response.json()["mode"] == "contract-aware-bounded-retrieval"
     assert response.json()["model_concurrency"] == 8
 
 

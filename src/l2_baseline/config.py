@@ -33,36 +33,29 @@ class Settings(BaseSettings):
     api_url: str = Field("https://model.hackathon.lunit.io", alias="LUNIT_FM_API_URL")
     api_key: SecretStr = Field(
         default_factory=_load_submission_api_key,
-        validation_alias=AliasChoices(
-            "LUNIT_FM_API_KEY", "OPENAI_API_KEY", "LUNIT_API_KEY"
-        ),
+        validation_alias=AliasChoices("LUNIT_FM_API_KEY", "OPENAI_API_KEY", "LUNIT_API_KEY"),
     )
     model: str = Field("Lunit/L2-preview", alias="LUNIT_FM_MODEL")
     mcp_url: str = Field("https://mcp.hackathon.lunit.io/mcp", alias="LUNIT_MCP_URL")
     patient_api_url: str = Field(
         "https://patient.hackathon.lunit.io", alias="LUNIT_PATIENT_API_URL"
     )
-    max_retrieval_calls: int = Field(2, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=2)
+    max_retrieval_calls: int = Field(3, alias="L2_MAX_RETRIEVAL_CALLS", ge=1, le=4)
     retrieval_top_k: int = Field(3, alias="L2_RETRIEVAL_TOP_K", ge=1, le=10)
-    tool_candidate_limit: int = Field(8, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=20)
-    retrieval_timeout_sec: float = Field(
-        18, alias="L2_RETRIEVAL_TIMEOUT_SEC", ge=5, le=25
-    )
-    max_tool_result_chars: int = Field(
-        6_000, alias="L2_MAX_TOOL_RESULT_CHARS", ge=1_000, le=12_000
-    )
-    max_evidence_chars: int = Field(
-        10_000, alias="L2_MAX_EVIDENCE_CHARS", ge=2_000, le=20_000
-    )
-    retrieval_max_tokens: int = Field(
-        512, alias="L2_RETRIEVAL_MAX_TOKENS", ge=256, le=1_024
-    )
-    request_timeout_sec: float = Field(
-        45, alias="L2_REQUEST_TIMEOUT_SEC", ge=10, le=50
-    )
-    turn_timeout_sec: float = Field(55, alias="L2_TURN_TIMEOUT_SEC", ge=15, le=60)
-    generation_max_tokens: int = Field(
-        2_048, alias="L2_GENERATION_MAX_TOKENS", ge=256, le=2_048
+    # Retained for environment compatibility. Retrieval now exposes the complete trained MCP set.
+    tool_candidate_limit: int = Field(20, alias="L2_TOOL_CANDIDATE_LIMIT", ge=2, le=30)
+    retrieval_timeout_sec: float = Field(28, alias="L2_RETRIEVAL_TIMEOUT_SEC", ge=5, le=40)
+    max_tool_result_chars: int = Field(6_000, alias="L2_MAX_TOOL_RESULT_CHARS", ge=1_000, le=12_000)
+    max_evidence_chars: int = Field(10_000, alias="L2_MAX_EVIDENCE_CHARS", ge=2_000, le=20_000)
+    retrieval_max_tokens: int = Field(512, alias="L2_RETRIEVAL_MAX_TOKENS", ge=256, le=1_024)
+    request_timeout_sec: float = Field(50, alias="L2_REQUEST_TIMEOUT_SEC", ge=10, le=60)
+    turn_timeout_sec: float = Field(120, alias="L2_TURN_TIMEOUT_SEC", ge=60, le=150)
+    fallback_reserve_sec: float = Field(36, alias="L2_FALLBACK_RESERVE_SEC", ge=20, le=50)
+    verifier_timeout_sec: float = Field(30, alias="L2_VERIFIER_TIMEOUT_SEC", ge=10, le=45)
+    generation_max_tokens: int = Field(2_048, alias="L2_GENERATION_MAX_TOKENS", ge=256, le=2_048)
+    concise_max_tokens: int = Field(768, alias="L2_CONCISE_MAX_TOKENS", ge=128, le=1_024)
+    verification_max_tokens: int = Field(
+        2_048, alias="L2_VERIFICATION_MAX_TOKENS", ge=512, le=2_048
     )
     max_history_messages: int = Field(6, alias="L2_MAX_HISTORY_MESSAGES", ge=2, le=10)
     max_message_chars: int = Field(4_000, alias="L2_MAX_MESSAGE_CHARS", ge=500, le=10_000)

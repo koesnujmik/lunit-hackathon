@@ -1,4 +1,4 @@
-# Lunit L2 Bounded Retrieval Driver
+# Lunit L2 Contract-Aware Retrieval Driver
 
 Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation driver입니다.
 최종 답변은 `Lunit/L2-preview`가 생성합니다.
@@ -6,18 +6,25 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
 ## 처리 흐름
 
 1. 첫 user 질문과 최근 5개 message를 유지하고 message별 길이를 제한합니다.
-2. 일반 의료 질문은 L2를 한 번 호출해 직접 답합니다.
-3. guideline, 법령, 급여, 허가, drug label, code, citation처럼 외부 근거가 명확히
-   필요한 질문만 retrieval로 보냅니다.
-4. Guideline은 결정적 2-step index 조회를 사용하고, 그 밖의 근거 질문은 L2 tool
-   selector 1회와 MCP tool 최대 2회로 제한해 18초 안에 끝냅니다.
-5. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
+2. L2가 답하기 전에 최신 요청의 task/artifact, audience, format, length, 제외 항목,
+   missing context, jurisdiction, evidence need를 answer contract로 적용합니다.
+3. 문서작성·교정·template 요청은 retrieval보다 요청된 산출물 생성을 우선합니다.
+4. 일반 의료 질문은 direct로 답합니다. 용량·간격·조절처럼 정밀한 임상 질문은 PubMed
+   vector retrieval로 좁혀 무관한 drug-label tool 선택을 막고, 최신 guideline·법령·허가·연구
+   요청은 해당 공식 source retrieval로 보냅니다.
+5. Guideline은 document → relevant section → page의 최대 3-step index 조회를 사용합니다.
+   그 밖의 근거 질문에서는 L2가 학습한 MCP tool 21개 전체 중 하나를 선택합니다.
+6. 저자원 환경과 핵심 자료가 누락된 위험평가는 전용 guarded generation으로 처리하고,
+   침습적 자가 처치·구체적 자가 투약·근거 없는 저위험 판단이 나오면 한 번 재생성합니다.
+   단일 수치와 관할권 확인도 각각 전용 schema 한 개를 `tool_choice=required`로 강제합니다.
+7. 1차 경로의 deadline을 넘기면 남겨 둔 예산으로 L2 direct fallback을 실행합니다.
 
-동시에 최대 8개 turn을 처리하며, 대기열에서 기다린 시간은 실제 turn의 55초 처리 제한에
+동시에 최대 8개 turn을 처리하며, 대기열에서 기다린 시간은 실제 turn의 120초 처리 제한에
 포함하지 않습니다.
 
-반복적인 HyDE/reflection loop는 사용하지 않습니다. Retrieval이 실패하거나 제한 시간을 넘겨도
-최종 L2 generation은 실행해 안전한 일반 답변과 근거 한계를 전달합니다.
+반복적인 HyDE/reflection loop는 사용하지 않습니다. Retrieval이 partial/no-evidence이거나
+제한 시간을 넘겨도 최종 L2 generation은 실제 질문에 답하고, 확인되지 않은 source-specific
+부분만 짧게 구분합니다.
 
 ## 로컬 Python 실행
 
@@ -73,14 +80,18 @@ Container는 `.env` 없이 image 내부의 `submission_api_key`를 읽고 `0.0.0
 ## 설정
 
 ```text
-L2_REQUEST_TIMEOUT_SEC=45
-L2_TURN_TIMEOUT_SEC=55
-L2_RETRIEVAL_TIMEOUT_SEC=18
-L2_MAX_RETRIEVAL_CALLS=2
+L2_REQUEST_TIMEOUT_SEC=50
+L2_TURN_TIMEOUT_SEC=120
+L2_FALLBACK_RESERVE_SEC=36
+L2_VERIFIER_TIMEOUT_SEC=30
+L2_RETRIEVAL_TIMEOUT_SEC=28
+L2_MAX_RETRIEVAL_CALLS=3
 L2_MAX_TOOL_RESULT_CHARS=6000
 L2_MAX_EVIDENCE_CHARS=10000
 L2_RETRIEVAL_MAX_TOKENS=512
 L2_GENERATION_MAX_TOKENS=2048
+L2_CONCISE_MAX_TOKENS=768
+L2_VERIFICATION_MAX_TOKENS=2048
 L2_MAX_HISTORY_MESSAGES=6
 L2_MAX_MESSAGE_CHARS=4000
 LUNIT_SUBMISSION_API_KEY_FILE=submission_api_key

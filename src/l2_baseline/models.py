@@ -26,6 +26,10 @@ class ReflectionDecision(BaseModel):
     next_query: str = ""
 
 
+class VerificationDecision(BaseModel):
+    final_answer: str
+
+
 class Evidence(BaseModel):
     cite_uid: str
     relevance_score: float
