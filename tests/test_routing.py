@@ -53,6 +53,27 @@ def _call(name: str, arguments: str, call_id: str = "call-1") -> Mock:
     return call
 
 
+def _finalize_response(
+    cite_uid: str = "cite-1",
+    status: str = "sufficient",
+    note: str = "",
+) -> object:
+    items = (
+        [{"cite_uid": cite_uid, "relevance_score": 0.95}]
+        if status != "no_evidence"
+        else []
+    )
+    return _response(
+        tool_calls=[
+            _call(
+                "finalize_retrieval",
+                json.dumps({"status": status, "items": items, "note": note}),
+                call_id="finalize-1",
+            )
+        ]
+    )
+
+
 class FakeMCP:
     def __init__(self) -> None:
         self.tools = [
@@ -366,6 +387,7 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
                     )
                 ]
             ),
+            _finalize_response(),
             _response(content="grounded answer"),
         ]
     )
@@ -382,7 +404,7 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     )
 
     assert answer == "grounded answer"
-    assert create.await_count == 2
+    assert create.await_count == 3
     assert len(mcp.calls) == 2
     assert [name for name, _arguments in mcp.calls] == [
         "index_get_relevant_nodes",
@@ -399,11 +421,17 @@ def test_source_route_opens_one_page_then_runs_final_generation() -> None:
     }
     decision_request = create.await_args_list[0].kwargs
     assert decision_request["tool_choice"] == "auto"
-    final_request = create.await_args_list[1].kwargs
-    assert final_request["tool_choice"] == "none"
-    assert [tool["function"]["name"] for tool in final_request["tools"]] == [
-        "retrieve_relevant_content"
+    finalize_request = create.await_args_list[1].kwargs
+    assert finalize_request["tool_choice"] == "required"
+    assert [tool["function"]["name"] for tool in finalize_request["tools"]] == [
+        "finalize_retrieval"
     ]
+    final_request = create.await_args_list[2].kwargs
+    assert "tool_choice" not in final_request
+    assert "tools" not in final_request
+    assert "Return only the final user-facing medical answer" in final_request[
+        "messages"
+    ][0]["content"]
     assert final_request["messages"][-2]["role"] == "assistant"
     assert final_request["messages"][-1]["role"] == "tool"
     assert "cite-1" in final_request["messages"][-1]["content"]
@@ -418,7 +446,11 @@ def test_text_tool_call_passes_a_self_contained_multiturn_query_to_retrieval() -
         "</tool_call>"
     )
     harness, create, mcp = _harness(
-        [_response(content=text_call), _response(content="grounded follow-up [1]")]
+        [
+            _response(content=text_call),
+            _finalize_response(),
+            _response(content="grounded follow-up [1]"),
+        ]
     )
 
     answer = asyncio.run(
@@ -438,13 +470,62 @@ def test_text_tool_call_passes_a_self_contained_multiturn_query_to_retrieval() -
     )
 
     assert answer == "grounded follow-up [1]"
-    assert create.await_count == 2
+    assert create.await_count == 3
     assert len(mcp.calls) == 2
     assert "68-year-old" in mcp.calls[0][1]["query"]
     assert "atrial fibrillation" in mcp.calls[0][1]["query"]
-    assert create.await_args_list[1].kwargs["messages"][-2]["tool_calls"][0][
+    assert create.await_args_list[2].kwargs["messages"][-2]["tool_calls"][0][
         "id"
-    ].startswith("generation-text-retrieve")
+    ].startswith("generation-text")
+
+
+def test_final_generation_retries_instead_of_leaking_a_text_tool_call() -> None:
+    leaked_tool_call = (
+        "<tool_call>retrieve_relevant_content"
+        "<arg_key>query</arg_key>"
+        "<arg_value>acute ischemic stroke alteplase contraindications</arg_value>"
+        "</tool_call>"
+    )
+    harness, create, _mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "retrieve_relevant_content",
+                        '{"query":"current clinical guideline CKD blood pressure target"}',
+                    )
+                ]
+            ),
+            _finalize_response(),
+            _response(content=leaked_tool_call),
+            _response(content="Grounded clinical answer [1]."),
+        ]
+    )
+
+    answer = asyncio.run(
+        harness.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "According to current clinical guidelines, what is the CKD BP target?"
+                    ),
+                }
+            ]
+        )
+    )
+
+    assert answer == "Grounded clinical answer [1]."
+    assert "<tool_call>" not in answer
+    assert create.await_count == 4
+    retry_request = create.await_args_list[3].kwargs
+    assert "tool_choice" not in retry_request
+    assert "tools" not in retry_request
+    assert "Do not return tool calls" in retry_request["messages"][0]["content"]
+    assert retry_request["messages"][-1]["role"] == "user"
+    assert "The retrieval stage is complete" in retry_request["messages"][-1][
+        "content"
+    ]
 
 
 def test_structured_source_route_skips_l2_tool_selection() -> None:
@@ -458,6 +539,7 @@ def test_structured_source_route_skips_l2_tool_selection() -> None:
                     )
                 ]
             ),
+            _finalize_response(),
             _response(content="E11 [1]"),
         ]
     )
@@ -467,7 +549,7 @@ def test_structured_source_route_skips_l2_tool_selection() -> None:
     )
 
     assert answer == "E11 [1]"
-    assert create.await_count == 2
+    assert create.await_count == 3
     assert mcp.calls == [
         (
             "kcd_search_codes",
@@ -487,6 +569,7 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
                     )
                 ]
             ),
+            _finalize_response(),
             _response(content="허가 적응증 답변 [1] [2]"),
         ]
     )
@@ -498,7 +581,7 @@ def test_mfds_detail_route_checks_permission_then_indication() -> None:
     )
 
     assert answer == "허가 적응증 답변 [1] [2]"
-    assert create.await_count == 2
+    assert create.await_count == 3
     assert mcp.calls == [
         (
             "openapi_mfds_check_drug_permission",
@@ -544,3 +627,70 @@ def test_retrieval_failure_still_runs_final_l2_generation() -> None:
         "Retrieval was unavailable"
         in create.await_args.kwargs["messages"][-1]["content"]
     )
+
+
+def test_retrieval_model_sees_all_mcp_tools_plus_finalize() -> None:
+    harness, create, mcp = _harness(
+        [
+            _response(
+                tool_calls=[
+                    _call(
+                        "openapi_law_search",
+                        '{"query":"medical evidence statute"}',
+                    )
+                ]
+            ),
+            _finalize_response(),
+        ]
+    )
+
+    result = asyncio.run(
+        harness.retrieve(
+            [{"role": "user", "content": "Find authoritative evidence for this request."}]
+        )
+    )
+
+    assert result.status == "sufficient"
+    assert [item.cite_uid for item in result.evidence] == ["cite-1"]
+    assert mcp.calls == [
+        ("openapi_law_search", {"query": "medical evidence statute"})
+    ]
+    first_tool_names = {
+        tool["function"]["name"] for tool in create.await_args_list[0].kwargs["tools"]
+    }
+    assert first_tool_names == {
+        *(tool["function"]["name"] for tool in mcp.tools),
+        "finalize_retrieval",
+    }
+    assert [
+        tool["function"]["name"]
+        for tool in create.await_args_list[1].kwargs["tools"]
+    ] == ["finalize_retrieval"]
+
+
+def test_text_finalize_call_selects_only_resolvable_citations() -> None:
+    text_finalize = (
+        "<tool_call>finalize_retrieval"
+        "<arg_key>status</arg_key><arg_value>sufficient</arg_value>"
+        "<arg_key>items</arg_key>"
+        '<arg_value>[{"cite_uid":"cite-1","relevance_score":0.9},'
+        '{"cite_uid":"invented","relevance_score":0.8}]</arg_value>'
+        "<arg_key>note</arg_key><arg_value></arg_value>"
+        "</tool_call>"
+    )
+    harness, _create, _mcp = _harness([_response(content=text_finalize)])
+
+    result = asyncio.run(
+        harness.retrieve(
+            [
+                {
+                    "role": "user",
+                    "content": "According to clinical guidelines, what is the CKD target?",
+                }
+            ]
+        )
+    )
+
+    assert result.status == "partial"
+    assert [item.cite_uid for item in result.evidence] == ["cite-1"]
+    assert "invented" in result.note

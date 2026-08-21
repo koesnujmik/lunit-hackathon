@@ -10,9 +10,11 @@ Lunit Hackathon 제출 규격을 따르는 containerized multi-turn conversation
    답할지 self-contained query로 retrieval을 요청할지 결정합니다.
 3. Retrieval 결과는 `role=tool` message로 같은 generation 대화에 전달하고 최종 답변을
    생성합니다.
-4. Guideline은 결정적 2-step index 조회를 사용하고, 그 밖의 근거 질문은 L2 tool
-   selector 1회와 MCP tool 최대 2회로 제한해 18초 안에 끝냅니다.
-5. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
+4. Retrieval L2에는 실제 MCP tools와 `finalize_retrieval`을 함께 제공합니다. Guideline은
+   결정적 2-step index 조회를 사용하고, 그 밖의 근거 질문은 L2가 MCP action을 선택합니다.
+5. MCP tool은 최대 2회 호출한 뒤 L2가 `finalize_retrieval`로 `status`, `note`, 관련
+   `cite_uid`를 제출하며, 실제 tool 결과에 존재하는 citation 본문만 generation에 전달합니다.
+6. 전체 turn을 55초로 제한하고 일반 JSON과 OpenAI-compatible SSE를 지원합니다.
 
 동시에 최대 8개 turn을 처리하며, 대기열에서 기다린 시간은 실제 turn의 55초 처리 제한에
 포함하지 않습니다.
