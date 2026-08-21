@@ -16,3 +16,7 @@ build/
 work/
 outputs/
 logs/
+
+# Local PowerShell and editor caches
+Microsoft/
+.venv/
