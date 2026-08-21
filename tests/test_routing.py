@@ -57,3 +57,47 @@ def test_retrieval_uses_native_generation_tool_trajectory() -> None:
     assert answer == "grounded answer"
     harness.retrieve.assert_awaited_once_with("self-contained query")
     assert create.await_count == 2
+
+
+def test_tool_selection_allows_model_to_choose_whether_to_call() -> None:
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[]))]
+    )
+    harness, create = _harness([response])
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "example_tool",
+                "description": "Example",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    actions = asyncio.run(harness._choose_actions(tools, "query", "passage"))
+
+    assert actions == []
+    assert create.await_args.kwargs["tool_choice"] == "auto"
+
+
+def test_structured_decision_uses_auto_tool_choice() -> None:
+    call = Mock()
+    call.function.arguments = '{"sufficient":true}'
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[call]))]
+    )
+    harness, create = _harness([response])
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "submit_decision",
+            "description": "Submit a decision",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    arguments = asyncio.run(harness._forced_decision("system", "content", tool))
+
+    assert arguments == {"sufficient": True}
+    assert create.await_args.kwargs["tool_choice"] == "auto"

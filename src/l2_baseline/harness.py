@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +18,8 @@ from .prompts import (
     TOOL_SELECTOR_SYSTEM_PROMPT,
 )
 from .ranking import rank_documents, rank_tool_candidates
+
+logger = logging.getLogger(__name__)
 
 
 def _decision_tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -118,6 +123,34 @@ def _evidence_context(evidence: list[Evidence]) -> str:
     )
 
 
+async def _run_mcp_actions(
+    mcp: LunitMCPClient, actions: list[Any], remaining_budget: int
+) -> list[str]:
+    """Run one round's MCP actions concurrently while preserving action order."""
+    selected_actions = actions[: max(remaining_budget, 0)]
+
+    async def run(action: Any) -> str:
+        started = time.perf_counter()
+        try:
+            return await mcp.call(
+                action.function.name, _arguments(action.function.arguments)
+            )
+        finally:
+            logger.info(
+                "timing stage=mcp_tool tool=%s duration_sec=%.3f",
+                action.function.name,
+                time.perf_counter() - started,
+            )
+
+    calls = [
+        run(action)
+        for action in selected_actions
+    ]
+    if not calls:
+        return []
+    return list(await asyncio.gather(*calls))
+
+
 class L2Harness:
     def __init__(
         self,
@@ -138,30 +171,44 @@ class L2Harness:
         self, system_prompt: str, user_content: str, tool: dict[str, Any]
     ) -> dict[str, Any]:
         name = tool["function"]["name"]
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            tools=[tool],
-            tool_choice="required",
-            temperature=0,
-        )
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                tools=[tool],
+                tool_choice="auto",
+                temperature=0,
+            )
+        finally:
+            logger.info(
+                "timing stage=l2_forced_decision tool=%s duration_sec=%.3f",
+                name,
+                time.perf_counter() - started,
+            )
         calls = response.choices[0].message.tool_calls or []
         if not calls:
             raise RuntimeError(f"L2 did not call required tool {name}")
         return _arguments(calls[0].function.arguments)
 
     async def create_hypothetical_passage(self, query: str) -> str:
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[
-                {"role": "system", "content": HYDE_SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            temperature=0.2,
-        )
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=[
+                    {"role": "system", "content": HYDE_SYSTEM_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.2,
+            )
+        finally:
+            logger.info(
+                "timing stage=hyde duration_sec=%.3f", time.perf_counter() - started
+            )
         return (response.choices[0].message.content or query).strip()
 
     async def _choose_actions(
@@ -186,13 +233,23 @@ class L2Harness:
                 f"\n\nREFLECTION SUMMARY:\n{reflection.analysis_summary}"
                 f"\n\nNEXT QUERY:\n{reflection.next_query}"
             )
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
-            tools=tools,
-            tool_choice="required",
-            temperature=0,
-        )
+        stage = "initial_tool_selection" if reflection is None else "react_tool_selection"
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
+                tools=tools,
+                tool_choice="auto",
+                temperature=0,
+            )
+        finally:
+            logger.info(
+                "timing stage=%s duration_sec=%.3f", stage, time.perf_counter() - started
+            )
         return response.choices[0].message.tool_calls or []
 
     async def _reflect(
@@ -231,6 +288,7 @@ class L2Harness:
         )
 
     async def retrieve(self, query: str) -> RetrievalResult:
+        retrieval_started = time.perf_counter()
         passage = await self.create_hypothetical_passage(query)
         documents: list[str] = []
         action_count = 0
@@ -240,21 +298,31 @@ class L2Harness:
             analysis_summary="Initial selection has not run.",
             next_query=query,
         )
+        mcp_connect_started = time.perf_counter()
         async with self.mcp_factory(
             self.settings.mcp_url, self.settings.token, self.settings.request_timeout_sec
         ) as mcp:
-            tools = await mcp.openai_tools()
+            logger.info(
+                "timing stage=mcp_connect duration_sec=%.3f",
+                time.perf_counter() - mcp_connect_started,
+            )
+            tool_list_started = time.perf_counter()
+            try:
+                tools = await mcp.openai_tools()
+            finally:
+                logger.info(
+                    "timing stage=mcp_list_tools duration_sec=%.3f",
+                    time.perf_counter() - tool_list_started,
+                )
             candidate_tools = rank_tool_candidates(
                 f"{query}\n{passage}", tools, self.settings.tool_candidate_limit
             )
             actions = await self._choose_actions(candidate_tools, query, passage)
             for round_number in range(1, self.settings.max_reflection_rounds + 1):
-                for action in actions:
-                    if action_count >= self.settings.max_retrieval_calls:
-                        break
-                    output = await mcp.call(action.function.name, _arguments(action.function.arguments))
-                    documents.append(output)
-                    action_count += 1
+                remaining_budget = self.settings.max_retrieval_calls - action_count
+                outputs = await _run_mcp_actions(mcp, actions, remaining_budget)
+                documents.extend(outputs)
+                action_count += len(outputs)
                 evidence = rank_documents(passage, documents, self.settings.retrieval_top_k)
                 reflection = await self._reflect(query, evidence, round_number)
                 if reflection.sufficient or action_count >= self.settings.max_retrieval_calls:
@@ -271,6 +339,11 @@ class L2Harness:
             query, evidence, reflection.sufficient, reflection.analysis_summary
         )
         result.tool_calls = action_count
+        logger.info(
+            "timing stage=retrieval_total tool_calls=%d duration_sec=%.3f",
+            action_count,
+            time.perf_counter() - retrieval_started,
+        )
         return result
 
     async def chat(self, messages: list[dict[str, str]]) -> str:
@@ -284,13 +357,20 @@ class L2Harness:
         generation_messages: list[dict[str, Any]] = [
             {"role": "system", "content": generation_prompt}, *messages
         ]
-        response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=generation_messages,
-            tools=[RETRIEVE_TOOL],
-            tool_choice="auto",
-            temperature=0.2,
-        )
+        routing_started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=generation_messages,
+                tools=[RETRIEVE_TOOL],
+                tool_choice="auto",
+                temperature=0.2,
+            )
+        finally:
+            logger.info(
+                "timing stage=generation_routing duration_sec=%.3f",
+                time.perf_counter() - routing_started,
+            )
         message = response.choices[0].message
         calls = message.tool_calls or []
         if not calls:
@@ -314,9 +394,16 @@ class L2Harness:
             generation_messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": content}
             )
-        final_response = await self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=generation_messages,
-            temperature=0.2,
-        )
+        final_started = time.perf_counter()
+        try:
+            final_response = await self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=generation_messages,
+                temperature=0.2,
+            )
+        finally:
+            logger.info(
+                "timing stage=final_generation duration_sec=%.3f",
+                time.perf_counter() - final_started,
+            )
         return final_response.choices[0].message.content or ""
