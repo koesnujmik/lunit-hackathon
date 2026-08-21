@@ -56,12 +56,14 @@ class OpenAICompatibleClient:
                     return json.loads(raw)
             except urllib.error.HTTPError as exc:
                 raw_error = exc.read().decode("utf-8", errors="replace")
-                if exc.code in {502, 503, 504} and attempt < 2:
+                if exc.code in {408, 429, 500, 502, 503, 504} and attempt < 2:
                     last_error = exc
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise APIError(f"POST {url} failed with HTTP {exc.code}: {raw_error}") from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except TimeoutError as exc:
+                raise APIError(f"POST {url} timed out after {self.timeout_sec:g}s.") from exc
+            except urllib.error.URLError as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))

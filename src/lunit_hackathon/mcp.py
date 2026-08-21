@@ -105,12 +105,16 @@ class MCPClient:
                     return self._parse_rpc_response(raw, response.headers.get("Content-Type", ""))
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
-                if exc.code in {502, 503, 504} and attempt < 2:
+                if exc.code in {408, 429, 500, 502, 503, 504} and attempt < 2:
                     last_error = exc
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise MCPError(f"MCP {method} failed with HTTP {exc.code}: {error_body}") from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except TimeoutError as exc:
+                raise MCPError(
+                    f"MCP {method} timed out after {self.timeout_sec:g}s."
+                ) from exc
+            except urllib.error.URLError as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))

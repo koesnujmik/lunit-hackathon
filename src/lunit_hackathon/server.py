@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from http import HTTPStatus
@@ -159,8 +158,8 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
+    host = "0.0.0.0"
+    port = 8000
     server = ThreadingHTTPServer((host, port), ChatHandler)
     print(f"Serving on {host}:{port}", flush=True)
     server.serve_forever()

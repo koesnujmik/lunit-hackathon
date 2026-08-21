@@ -22,6 +22,8 @@ class Settings:
     max_retrieval_tool_calls: int
     max_tool_result_chars: int
     max_evidence_chars: int
+    generation_max_tokens: int
+    retrieval_max_tokens: int
 
 
 def _read_bool(name: str, default: bool) -> bool:
@@ -52,7 +54,7 @@ def load_settings(require_api_key: bool = True) -> Settings:
     if require_api_key and not api_key:
         raise RuntimeError("Missing LUNIT_FM_API_KEY. Set it in your shell or source .env first.")
 
-    timeout_raw = os.getenv("LUNIT_TIMEOUT_SEC", "60").strip()
+    timeout_raw = os.getenv("LUNIT_TIMEOUT_SEC", "40").strip()
     try:
         timeout_sec = float(timeout_raw)
     except ValueError as exc:
@@ -76,7 +78,9 @@ def load_settings(require_api_key: bool = True) -> Settings:
         timeout_sec=timeout_sec,
         enable_retrieval=_read_bool("LUNIT_ENABLE_RETRIEVAL", True),
         routing_mode=routing_mode,
-        max_retrieval_tool_calls=_read_positive_int("LUNIT_MAX_RETRIEVAL_TOOL_CALLS", 6),
-        max_tool_result_chars=_read_positive_int("LUNIT_MAX_TOOL_RESULT_CHARS", 12_000),
-        max_evidence_chars=_read_positive_int("LUNIT_MAX_EVIDENCE_CHARS", 24_000),
+        max_retrieval_tool_calls=_read_positive_int("LUNIT_MAX_RETRIEVAL_TOOL_CALLS", 2),
+        max_tool_result_chars=_read_positive_int("LUNIT_MAX_TOOL_RESULT_CHARS", 6_000),
+        max_evidence_chars=_read_positive_int("LUNIT_MAX_EVIDENCE_CHARS", 4_000),
+        generation_max_tokens=_read_positive_int("LUNIT_GENERATION_MAX_TOKENS", 1_600),
+        retrieval_max_tokens=_read_positive_int("LUNIT_RETRIEVAL_MAX_TOKENS", 768),
     )

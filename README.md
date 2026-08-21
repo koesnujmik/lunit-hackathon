@@ -59,9 +59,11 @@ Runtime controls:
 ```bash
 export LUNIT_ENABLE_RETRIEVAL=true
 export LUNIT_ROUTING_MODE=hybrid
-export LUNIT_MAX_RETRIEVAL_TOOL_CALLS=6
-export LUNIT_MAX_TOOL_RESULT_CHARS=12000
-export LUNIT_MAX_EVIDENCE_CHARS=24000
+export LUNIT_MAX_RETRIEVAL_TOOL_CALLS=2
+export LUNIT_MAX_TOOL_RESULT_CHARS=6000
+export LUNIT_MAX_EVIDENCE_CHARS=4000
+export LUNIT_GENERATION_MAX_TOKENS=1600
+export LUNIT_RETRIEVAL_MAX_TOKENS=768
 ```
 
 `hybrid` forces retrieval for explicit source requests, allows it for recognized source families,

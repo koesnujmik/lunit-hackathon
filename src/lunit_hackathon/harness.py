@@ -13,7 +13,11 @@ from .api import (
 )
 from .config import Settings
 from .mcp import MCPError
-from .prompts import DIRECT_GENERATION_SYSTEM_PROMPT, GENERATION_SYSTEM_PROMPT
+from .prompts import (
+    DIRECT_GENERATION_SYSTEM_PROMPT,
+    GENERATION_SYSTEM_PROMPT,
+    GROUNDED_GENERATION_SYSTEM_PROMPT,
+)
 from .retrieval import RetrievalEngine, RetrievalResult
 from .routing import (
     conversation_user_text,
@@ -95,6 +99,7 @@ class L2Harness:
         mcp_tool_calls = 0
 
         for _ in range(3):
+            recovery_used = False
             tools_enabled = self.settings.enable_retrieval and retrieval_count == 0
             extra_body: dict[str, Any] = {}
             if self.settings.enable_retrieval and not direct_fast_path:
@@ -115,19 +120,47 @@ class L2Harness:
                     "tool_choice": tool_choice,
                 }
 
-            response = self.chat_client.chat_completions(
-                model=self.settings.fm_model,
-                messages=messages,
-                temperature=0,
-                extra_body=extra_body,
-            )
+            try:
+                response = self.chat_client.chat_completions(
+                    model=self.settings.fm_model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=self.settings.generation_max_tokens,
+                    extra_body=extra_body,
+                )
+            except APIError as exc:
+                _log_generation_recovery(exc, retrieval_count)
+                recovery_used = True
+                response = self.chat_client.chat_completions(
+                    model=self.settings.fm_model,
+                    messages=_recovery_messages(messages),
+                    temperature=0,
+                    max_tokens=min(self.settings.generation_max_tokens, 1_400),
+                    extra_body={},
+                )
             message = first_choice_message(response)
             tool_calls = message_tool_calls(message)
 
             if not tool_calls:
                 content = message.get("content")
                 if not isinstance(content, str) or not content.strip():
-                    raise APIError("Generation L2 returned neither content nor a tool call.")
+                    if recovery_used:
+                        raise APIError("Generation L2 returned neither content nor a tool call.")
+                    empty_error = APIError(
+                        "Generation L2 exhausted its output budget before producing content."
+                    )
+                    _log_generation_recovery(empty_error, retrieval_count)
+                    response = self.chat_client.chat_completions(
+                        model=self.settings.fm_model,
+                        messages=_recovery_messages(messages),
+                        temperature=0,
+                        max_tokens=self.settings.generation_max_tokens,
+                        extra_body={},
+                    )
+                    message = first_choice_message(response)
+                    content = message.get("content")
+                    if not isinstance(content, str) or not content.strip():
+                        raise APIError("Generation L2 returned no content after recovery.")
                 _log_trace(retrieval_status, retrieval_count, mcp_tool_calls, started)
                 return content.strip()
 
@@ -148,7 +181,7 @@ class L2Harness:
 
                 retrieval_count += 1
                 retrieval_query = query.strip()
-                if force_retrieval and not source_families(retrieval_query):
+                if force_retrieval:
                     retrieval_query = (
                         f"{retrieval_query}\n\nSource requirement from the user: "
                         f"{latest_user_text(conversation)}"
@@ -172,15 +205,12 @@ class L2Harness:
                         )
                 retrieval_status = retrieval.status
                 mcp_tool_calls += retrieval.mcp_tool_calls
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": retrieval.as_generation_content(
-                            self.settings.max_evidence_chars
-                        ),
-                    }
+                evidence_content = retrieval.as_generation_content(
+                    self.settings.max_evidence_chars,
+                    query=retrieval_query,
                 )
+                messages = _grounded_generation_messages(conversation, evidence_content)
+                direct_fast_path = True
 
         raise APIError("Generation L2 did not produce a final answer within the call budget.")
 
@@ -227,6 +257,70 @@ def _log_trace(
                 "retrieval_calls": retrieval_count,
                 "mcp_tool_calls": mcp_tool_calls,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
+            }
+        ),
+        flush=True,
+    )
+
+
+def _recovery_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    conversation: list[dict[str, str]] = []
+    evidence = ""
+    evidence_marker = "Retrieved authoritative evidence:\n"
+
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role == "tool" and isinstance(content, str):
+            evidence = content[:4_000]
+        elif (
+            role == "system"
+            and isinstance(content, str)
+            and evidence_marker in content
+        ):
+            evidence = content.split(evidence_marker, 1)[1][:4_000]
+        elif role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            conversation.append({"role": role, "content": content[:2_500]})
+
+    system_content = (
+        DIRECT_GENERATION_SYSTEM_PROMPT
+        + "\nProduce the final answer now. Do not emit or call a tool. "
+        "When retrieved evidence is provided, use it cautiously and preserve its [n] citations."
+    )
+    if evidence:
+        system_content += (
+            "\n\nRetrieved evidence from the interrupted generation path:\n"
+            f"{evidence}"
+        )
+    return [
+        {"role": "system", "content": system_content},
+        *conversation[-4:],
+    ]
+
+
+def _grounded_generation_messages(
+    conversation: list[dict[str, Any]], evidence_content: str
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{GROUNDED_GENERATION_SYSTEM_PROMPT}\n\n"
+                "Retrieved authoritative evidence:\n"
+                f"{evidence_content}"
+            ),
+        },
+        *conversation,
+    ]
+
+
+def _log_generation_recovery(error: APIError, retrieval_count: int) -> None:
+    print(
+        json.dumps(
+            {
+                "event": "generation_recovery",
+                "retrieval_calls": retrieval_count,
+                "error_type": type(error).__name__,
             }
         ),
         flush=True,
